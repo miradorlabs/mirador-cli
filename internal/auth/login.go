@@ -33,6 +33,8 @@ type LoginOptions struct {
 	// environment where launching a browser would silently do nothing.
 	NoBrowser bool
 	Out       io.Writer
+	// Timeout overrides how long to wait at the browser. Zero means loginTimeout.
+	Timeout time.Duration
 }
 
 // Login runs the full browser handoff and returns the resulting credential.
@@ -71,18 +73,29 @@ func Login(ctx context.Context, exchanger TokenExchanger, opts LoginOptions) (*C
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		// Reject anything not addressed to the loopback listener by name. A page on a
+		// domain that resolves to 127.0.0.1 (DNS rebinding) reaches this handler with its
+		// own Host, and the same-origin policy would then let it read the response.
+		if !isLoopbackRequest(r, port) {
+			http.Error(w, "invalid host", http.StatusBadRequest)
+			return
+		}
+
 		query := r.URL.Query()
 		gotState := query.Get("state")
 		code := query.Get("code")
 
+		// A mismatched or empty callback is not fatal to the login. Any local process, and
+		// any web page that guesses the port, can hit this endpoint; letting such a request
+		// abort the pending login would hand an attacker a trivial denial of service on
+		// `mirador login`. Ignore it and keep waiting for the real one — the overall
+		// timeout still bounds how long that can take.
 		if subtle.ConstantTimeCompare([]byte(gotState), []byte(state)) != 1 {
-			writeResultPage(w, http.StatusBadRequest, "Authorization failed", "The login attempt did not match this terminal session. Start again with mirador login.")
-			results <- callback{err: errors.New("callback state did not match: refusing a code this session did not request")}
+			writeResultPage(w, http.StatusBadRequest, "Authorization failed", "This request did not match the login your terminal started.")
 			return
 		}
 		if code == "" {
 			writeResultPage(w, http.StatusBadRequest, "Authorization failed", "No authorization code was returned.")
-			results <- callback{err: errors.New("callback did not carry an authorization code")}
 			return
 		}
 		writeResultPage(w, http.StatusOK, "You're signed in", "You can close this tab and return to your terminal.")
@@ -112,7 +125,11 @@ func Login(ctx context.Context, exchanger TokenExchanger, opts LoginOptions) (*C
 	}
 	fmt.Fprintln(out, "Waiting for authorization...")
 
-	ctx, cancel := context.WithTimeout(ctx, loginTimeout)
+	timeout := opts.Timeout
+	if timeout == 0 {
+		timeout = loginTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	select {
@@ -123,10 +140,28 @@ func Login(ctx context.Context, exchanger TokenExchanger, opts LoginOptions) (*C
 		return exchanger.ExchangeCode(ctx, res.code, pkce.Verifier, port)
 	case <-ctx.Done():
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("timed out after %s waiting for browser authorization", loginTimeout)
+			return nil, fmt.Errorf("timed out after %s waiting for browser authorization", timeout)
 		}
 		return nil, ctx.Err()
 	}
+}
+
+// isLoopbackRequest reports whether the request is addressed to this listener on loopback.
+// An absent Host is rejected: every real browser sends one.
+func isLoopbackRequest(r *http.Request, port int) bool {
+	host, hostPort, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		// No port in Host — never what a browser sends for an explicit :port URL.
+		return false
+	}
+	if hostPort != strconv.Itoa(port) {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func buildAuthorizeURL(appURL, challenge, state string, port int, label string) string {

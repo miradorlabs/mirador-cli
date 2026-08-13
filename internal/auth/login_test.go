@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -138,35 +139,6 @@ func TestLogin_ExchangesCodeWithTheVerifierAndPort(t *testing.T) {
 	}
 }
 
-func TestLogin_RejectsCallbackWithMismatchedState(t *testing.T) {
-	exchanger := &recordingExchanger{}
-	capture := &urlCapture{ch: make(chan string, 1)}
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := Login(context.Background(), exchanger, LoginOptions{
-			AppURL:    "https://app.example.test",
-			NoBrowser: true,
-			Out:       capture,
-		})
-		done <- err
-	}()
-
-	authURL := <-capture.ch
-	browser(t, authURL, "mir_cod_attacker", "not-the-state-we-issued")
-
-	err := <-done
-	if err == nil {
-		t.Fatal("expected login to fail on a state mismatch")
-	}
-	if !strings.Contains(err.Error(), "state") {
-		t.Errorf("error should name the state mismatch, got %v", err)
-	}
-	if exchanger.code != "" {
-		t.Error("a code with the wrong state must never reach the token endpoint")
-	}
-}
-
 func TestLogin_PropagatesExchangeFailure(t *testing.T) {
 	wantErr := errors.New("invalid or expired credentials")
 	exchanger := &recordingExchanger{err: wantErr}
@@ -229,5 +201,139 @@ func TestNewPKCE_ProducesAValidS256Pair(t *testing.T) {
 	}
 	if other.Verifier == pkce.Verifier {
 		t.Error("two logins produced the same verifier")
+	}
+}
+
+// callbackWithHost issues a raw callback with a chosen Host header, which is how a DNS
+// rebinding attack reaches a loopback listener.
+func callbackWithHost(t *testing.T, port int, host, code, state string) *http.Response {
+	t.Helper()
+	target := fmt.Sprintf("http://127.0.0.1:%d/callback?code=%s&state=%s",
+		port, url.QueryEscape(code), url.QueryEscape(state))
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if host != "" {
+		req.Host = host
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("callback request: %v", err)
+	}
+	return resp
+}
+
+func portFrom(t *testing.T, authURL string) (port int, state string) {
+	t.Helper()
+	parsed, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("parse authorize url: %v", err)
+	}
+	p, err := strconv.Atoi(parsed.Query().Get("port"))
+	if err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+	return p, parsed.Query().Get("state")
+}
+
+// TestLogin_RejectsCallbackFromAForeignHost covers DNS rebinding: a page served from a
+// domain that resolves to 127.0.0.1 reaches this listener carrying its own Host, and the
+// same-origin policy would then let it read the response.
+func TestLogin_RejectsCallbackFromAForeignHost(t *testing.T) {
+	exchanger := &recordingExchanger{}
+	capture := &urlCapture{ch: make(chan string, 1)}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Login(context.Background(), exchanger, LoginOptions{
+			AppURL: "https://app.example.test", NoBrowser: true, Out: capture,
+		})
+		done <- err
+	}()
+
+	authURL := <-capture.ch
+	port, state := portFrom(t, authURL)
+
+	resp := callbackWithHost(t, port, "evil.example.com:"+strconv.Itoa(port), "mir_cod_rebind", state)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("foreign Host should be rejected, got %d", resp.StatusCode)
+	}
+	if exchanger.code != "" {
+		t.Error("a code delivered under a foreign Host must never be exchanged")
+	}
+
+	// The real callback must still work — the guard is not simply blocking everything.
+	browser(t, authURL, "mir_cod_real", "")
+	if err := <-done; err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if exchanger.code != "mir_cod_real" {
+		t.Errorf("code = %q, want the legitimate one", exchanger.code)
+	}
+}
+
+// TestLogin_WrongStateDoesNotCancelThePendingLogin closes a denial of service: any local
+// process, and any web page that guesses the port, can hit the callback. If a mismatched
+// state aborted the login, an attacker could stop a user from ever logging in.
+func TestLogin_WrongStateDoesNotCancelThePendingLogin(t *testing.T) {
+	exchanger := &recordingExchanger{}
+	capture := &urlCapture{ch: make(chan string, 1)}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Login(context.Background(), exchanger, LoginOptions{
+			AppURL: "https://app.example.test", NoBrowser: true, Out: capture,
+		})
+		done <- err
+	}()
+
+	authURL := <-capture.ch
+
+	// Three hostile attempts, then the genuine one.
+	for i := range 3 {
+		browser(t, authURL, fmt.Sprintf("mir_cod_attacker%d", i), "not-the-state-we-issued")
+	}
+	browser(t, authURL, "mir_cod_real", "")
+
+	if err := <-done; err != nil {
+		t.Fatalf("Login should survive hostile callbacks: %v", err)
+	}
+	if exchanger.code != "mir_cod_real" {
+		t.Errorf("code = %q, want the legitimate one — an attacker must not be able to divert or cancel the login", exchanger.code)
+	}
+}
+
+// TestLogin_HostileCallbacksAloneNeverAuthenticate is the other half of the DoS fix: a
+// mismatched state must not merely be non-fatal, it must never authenticate. With no
+// legitimate callback the login fails closed, on the timeout, having exchanged nothing.
+func TestLogin_HostileCallbacksAloneNeverAuthenticate(t *testing.T) {
+	exchanger := &recordingExchanger{}
+	capture := &urlCapture{ch: make(chan string, 1)}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Login(context.Background(), exchanger, LoginOptions{
+			AppURL:    "https://app.example.test",
+			NoBrowser: true,
+			Out:       capture,
+			Timeout:   2 * time.Second,
+		})
+		done <- err
+	}()
+
+	authURL := <-capture.ch
+	browser(t, authURL, "mir_cod_attacker", "not-the-state-we-issued")
+
+	err := <-done
+	if err == nil {
+		t.Fatal("expected the login to fail when only hostile callbacks arrive")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected a timeout, got %v", err)
+	}
+	if exchanger.code != "" {
+		t.Error("a code with the wrong state must never reach the token endpoint")
 	}
 }

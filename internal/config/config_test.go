@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -141,5 +142,65 @@ func TestSaveFile_WritesConfigWorldReadableButNotTheCredentialFile(t *testing.T)
 	// The config holds no secrets; the credential file (0600) is the one that does.
 	if perm := info.Mode().Perm(); perm != 0o644 {
 		t.Errorf("config mode = %o, want 644", perm)
+	}
+}
+
+// TestLoad_RefusesCleartextRemoteEndpoints guards the CLI's most damaging misconfiguration:
+// every one of these URLs carries a secret (the auth host receives the PKCE verifier and the
+// refresh token; the api host receives the access token), so an http:// endpoint would put
+// them on the wire in the clear with nothing else in the CLI noticing.
+func TestLoad_RefusesCleartextRemoteEndpoints(t *testing.T) {
+	seedConfig(t, nil)
+
+	for _, tc := range []struct {
+		name     string
+		override Overrides
+	}{
+		{"api", Overrides{APIURL: "http://attacker.example.com"}},
+		{"auth", Overrides{AuthURL: "http://attacker.example.com"}},
+		{"app", Overrides{AppURL: "http://attacker.example.com"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(tc.override)
+			if err == nil {
+				t.Fatal("expected a cleartext remote endpoint to be refused")
+			}
+			if !strings.Contains(err.Error(), "cleartext") {
+				t.Errorf("error should explain why, got %v", err)
+			}
+		})
+	}
+}
+
+// TestLoad_AllowsCleartextLoopback keeps local development working — a local stack has no
+// certificate, and its traffic never leaves the machine.
+func TestLoad_AllowsCleartextLoopback(t *testing.T) {
+	seedConfig(t, nil)
+
+	for _, host := range []string{
+		"http://localhost:8057",
+		"http://127.0.0.1:8057",
+		"http://127.0.0.2:8057", // still 127.0.0.0/8
+		"http://[::1]:8057",
+	} {
+		t.Run(host, func(t *testing.T) {
+			if _, err := Load(Overrides{AuthURL: host}); err != nil {
+				t.Errorf("loopback %q should be allowed: %v", host, err)
+			}
+		})
+	}
+}
+
+// TestLoad_RejectsNonHTTPSchemes stops a config from pointing the CLI at something that is
+// not a web endpoint at all — file:// would be handed to the browser opener verbatim.
+func TestLoad_RejectsNonHTTPSchemes(t *testing.T) {
+	seedConfig(t, nil)
+
+	for _, raw := range []string{"file:///etc/passwd", "javascript:alert(1)", "ftp://example.com", "not-a-url"} {
+		t.Run(raw, func(t *testing.T) {
+			if _, err := Load(Overrides{AppURL: raw}); err == nil {
+				t.Errorf("expected %q to be rejected", raw)
+			}
+		})
 	}
 }

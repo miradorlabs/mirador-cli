@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,7 +109,59 @@ func Load(o Overrides) (*Config, error) {
 	if cfg.ProjectID != profile.ProjectID {
 		cfg.ProjectName = ""
 	}
+
+	for _, endpoint := range []struct{ name, value string }{
+		{"api", cfg.APIURL},
+		{"auth", cfg.AuthURL},
+		{"app", cfg.AppURL},
+	} {
+		if err := validateEndpoint(endpoint.name, endpoint.value); err != nil {
+			return nil, err
+		}
+	}
 	return cfg, nil
+}
+
+// validateEndpoint refuses to send credentials over cleartext to anywhere but loopback.
+//
+// Every one of these URLs carries a secret at some point: the auth endpoint receives the
+// authorization code, the PKCE verifier, and the refresh token; the api endpoint receives the
+// access token. A mistyped, copied, or hostile `http://` endpoint would put all of them on the
+// wire in the clear, and nothing else in the CLI would notice. http is allowed for loopback
+// only, because a local stack has no certificate and never leaves the machine.
+func validateEndpoint(name, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid %s URL %q: %w", name, raw, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid %s URL %q: missing host", name, raw)
+	}
+
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf(
+			"refusing to use %s URL %q: http would send your credentials in cleartext — use https (http is allowed only for localhost)",
+			name, raw)
+	default:
+		return fmt.Errorf("invalid %s URL %q: scheme must be https", name, raw)
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	// Covers 127.0.0.0/8 and ::1, not just the literal 127.0.0.1 a check on the string would.
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func LoadFile() (*File, error) {
