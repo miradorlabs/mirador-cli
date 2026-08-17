@@ -100,6 +100,12 @@ func New(cfg *config.Config, opts Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Refuse before the first request rather than letting the wrong environment's auth
+	// host answer 401 — a message naming both hosts is the difference between "my login
+	// broke" and "I am pointed at dev".
+	if err := cred.CheckEnvironment(c.authURL); err != nil {
+		return nil, err
+	}
 	c.credential = cred
 	return c, nil
 }

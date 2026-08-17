@@ -3,10 +3,6 @@
 The command-line client for the [Mirador](https://mirador.org) API — traces, OpenTelemetry
 logs, PromQL metrics, and dashboards, from your terminal.
 
-Replaces the deprecated Node CLI (`mirador-cli-deprecated`). The headline difference: you
-log in through your browser instead of pasting an API key, and one credential reaches every
-project in your organization.
-
 ```
 $ mirador login
 Opening your browser to authorize the CLI.
@@ -39,20 +35,46 @@ make build      # → bin/mirador
 make dist       # cross-compiled release binaries
 ```
 
-## Two endpoints
+## Endpoints and environments
 
-The CLI talks to two hosts, and knows which is which:
+The CLI talks to three hosts, and knows which is which:
 
 | Host | Used for |
 |---|---|
 | `auth.mirador.org` | `login`, `logout`, token refresh, `project list`, `org list` |
 | `api.mirador.org` | `trace`, `log`, `metric`, `dashboard` |
+| `app.mirador.org` | the browser page `login` opens |
 
 Credentials are minted on their own host so an auth outage cannot take reads down with it — the
 data API validates tokens directly against Redis and never calls the auth host per request.
 
-Both default correctly; override with `--auth-url` / `--api-url`, the matching `MIRADOR_*`
-environment variables, or `mirador config set`.
+**Production is the default.** Nothing needs configuring to use Mirador.
+
+Working on Mirador itself? Select an environment and all three hosts move together:
+
+```bash
+mirador config envs           # what is available
+mirador --env dev whoami      # one command against dev
+```
+
+| Environment | Auth | API | App |
+|---|---|---|---|
+| `prod` *(default)* | `auth.mirador.org` | `api.mirador.org` | `app.mirador.org` |
+| `dev` | `auth-dev.mirador.org` | `api-dev.mirador.org` | `beta.mirador.org` |
+| `local` | `localhost:8057` | `localhost:8055` | `localhost:3000` |
+
+`prd`, `production`, `development` and `localhost` are accepted as aliases.
+
+They move together because they are only meaningful together — a credential minted by one
+environment's auth host is worthless to another's data host. Picking hosts one at a time is how
+you end up authenticating against prod while reading dev.
+
+For anything not in that table, set the hosts individually; an explicit URL always beats the
+environment, so you can point one host at a laptop without abandoning the preset for the other two:
+
+```bash
+mirador --env dev --api-url http://localhost:8055 trace list
+```
 
 ## Authentication
 
@@ -122,7 +144,7 @@ The selection is stored in the active profile. Every project-scoped request send
 | `mirador log query \| stats` | Query OpenTelemetry logs |
 | `mirador metric list \| query \| range` | Explore metrics and run PromQL |
 | `mirador dashboard list \| get` | Read dashboards |
-| `mirador config show \| profiles \| use \| set` | Manage profiles |
+| `mirador config show \| profiles \| use \| set \| envs` | Manage profiles and environments |
 
 Dashboard writes are deliberately absent. They are destructive and ETag-guarded; a mistyped
 CLI argument should not be able to replace a dashboard a team depends on.
@@ -141,7 +163,8 @@ letting a partial answer look complete.
 
 ## Configuration
 
-Resolution order for every setting: **flag → environment → active profile → default**.
+Resolution order for every setting: **flag → environment variable → active profile → environment
+preset**. The preset supplies the baseline endpoints; anything more specific overrides it.
 
 `~/.mirador/config.json` (`0644`) holds endpoints and selections.
 `~/.mirador/credentials.json` (`0600`) holds tokens. They are separate files so you can
@@ -150,6 +173,7 @@ share, diff, or version the config without dragging credentials along.
 | Environment variable | Effect |
 |---|---|
 | `MIRADOR_API_KEY` | Use a `mir_srv_*` server key; skips the browser entirely |
+| `MIRADOR_ENV` | Environment preset: `prod` (default), `dev`, `local` |
 | `MIRADOR_API_URL` | Data API base URL (traces, logs, metrics, dashboards) |
 | `MIRADOR_AUTH_URL` | Auth API base URL (login, refresh, projects, organizations) |
 | `MIRADOR_APP_URL` | App base URL used by `login` |
@@ -158,16 +182,28 @@ share, diff, or version the config without dragging credentials along.
 | `MIRADOR_ORGANIZATION_ID` | Organization to scope to |
 | `MIRADOR_CONFIG_DIR` | Override `~/.mirador` |
 
-Profiles keep environments side by side:
+Profiles keep environments side by side, each with **its own credential** — which is what makes
+switching between them safe rather than merely convenient:
 
 ```bash
-mirador config use local
-mirador config set \
-  --api-url  http://localhost:8055 \
-  --auth-url http://localhost:8057 \
-  --app-url  http://localhost:3000
-mirador login
+mirador config use dev-work      # creates the profile if new
+mirador config set --env dev
+mirador login                    # this credential belongs to this profile
+
+mirador config use default       # back to prod, with its own login
 ```
+
+A credential records the host that issued it. Point a profile somewhere else and the CLI says so
+instead of sending a dev token to prod and reporting a confusing 401:
+
+```
+Error: this profile is logged in against https://auth-dev.mirador.org but is now pointed at
+https://auth.mirador.org — run `mirador login` for this environment, or switch profiles with
+`mirador config use <profile>`
+```
+
+`mirador config set --env <name>` clears any per-URL overrides stored on that profile, since they
+outrank the environment and would otherwise silently defeat the switch.
 
 ## Development
 
@@ -240,14 +276,13 @@ It drives login through the same Express endpoint the `/cli/auth` page calls, th
 same loopback redirect, and asserts credential file permissions, project scoping, cross-tenant
 denial, silent refresh, and revoke-on-logout.
 
-To drive it by hand instead, point the CLI at the local hosts — `http` is accepted for loopback
-only:
+To drive it by hand instead, use the `local` environment — `http` is accepted for loopback only,
+so this preset is the one place cleartext is allowed:
 
 ```bash
-export MIRADOR_AUTH_URL=http://localhost:8057 \
-       MIRADOR_API_URL=http://localhost:8055 \
-       MIRADOR_APP_URL=http://localhost:3000
-./bin/mirador login --no-browser
+./bin/mirador --env local login --no-browser
+# or, to make it stick for a profile:
+./bin/mirador config use localdev && ./bin/mirador config set --env local
 ```
 
 **Tear down:** `docker rm -f mirador-local`.

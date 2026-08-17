@@ -22,10 +22,10 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 export MIRADOR_CONFIG_DIR="$WORK/home"
-export MIRADOR_AUTH_URL="${MIRADOR_LOCAL_AUTH_URL:-http://localhost:8057}"
-export MIRADOR_API_URL="${MIRADOR_LOCAL_API_URL:-http://localhost:8055}"
-export MIRADOR_APP_URL="${MIRADOR_LOCAL_APP_URL:-http://localhost:3000}"
-unset MIRADOR_API_KEY
+# The `local` environment preset is exactly these three hosts; using it here means the
+# runbook exercises the same selector a developer would.
+export MIRADOR_ENV=local
+unset MIRADOR_API_KEY MIRADOR_AUTH_URL MIRADOR_API_URL MIRADOR_APP_URL
 mkdir -p "$MIRADOR_CONFIG_DIR"
 
 step() { printf '\n\033[1m── %s\033[0m\n' "$1"; }
@@ -48,7 +48,7 @@ step "2. mirador login (browser handoff simulated below)"
 "$CLI" login --no-browser --label local-e2e > "$WORK/login.out" 2> "$WORK/login.err" &
 LOGIN_PID=$!
 for _ in $(seq 1 60); do
-  URL=$(grep -o "${MIRADOR_APP_URL}/cli/auth?[^ ]*" "$WORK/login.err" 2>/dev/null | head -1)
+  URL=$(grep -o "http://localhost:3000/cli/auth?[^ ]*" "$WORK/login.err" 2>/dev/null | head -1)
   [ -n "${URL:-}" ] && break
   sleep 0.2
 done

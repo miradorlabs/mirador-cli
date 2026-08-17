@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -20,6 +21,7 @@ var Version = "dev"
 
 type globalFlags struct {
 	profile   string
+	env       string
 	apiURL    string
 	authURL   string
 	appURL    string
@@ -48,6 +50,7 @@ pins one project and skips the browser entirely.`,
 
 	pf := root.PersistentFlags()
 	pf.StringVar(&flags.profile, "profile", "", "configuration profile to use")
+	pf.StringVar(&flags.env, "env", "", "environment to talk to: "+strings.Join(config.EnvironmentNames(), ", ")+" (default prod)")
 	pf.StringVar(&flags.apiURL, "api-url", "", "Mirador data API base URL")
 	pf.StringVar(&flags.authURL, "auth-url", "", "Mirador auth API base URL")
 	pf.StringVar(&flags.appURL, "app-url", "", "Mirador app base URL (used by login)")
@@ -77,6 +80,11 @@ func Execute() int {
 			fmt.Fprintln(os.Stderr, "Error: not logged in. Run `mirador login` (or set MIRADOR_API_KEY for a server key).")
 			return 1
 		}
+		var wrongEnv *auth.ErrWrongEnvironment
+		if errors.As(err, &wrongEnv) {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", wrongEnv)
+			return 1
+		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
@@ -85,11 +93,12 @@ func Execute() int {
 
 func loadConfig() (*config.Config, error) {
 	return config.Load(config.Overrides{
-		Profile:   flags.profile,
-		APIURL:    flags.apiURL,
-		AuthURL:   flags.authURL,
-		AppURL:    flags.appURL,
-		ProjectID: flags.projectID,
+		Profile:     flags.profile,
+		Environment: flags.env,
+		APIURL:      flags.apiURL,
+		AuthURL:     flags.authURL,
+		AppURL:      flags.appURL,
+		ProjectID:   flags.projectID,
 	})
 }
 

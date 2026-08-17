@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -319,5 +321,91 @@ func TestClient_RoutesCredentialCallsToTheAuthHost(t *testing.T) {
 	}
 	if !slices.Contains(dataPaths, "/v1/traces") {
 		t.Errorf("trace reads should go to the data host, got %v", dataPaths)
+	}
+}
+
+// TestClient_RefusesACredentialFromAnotherEnvironment covers the mistake a developer
+// makes weekly: logging in against dev, then running a command with the prod endpoints.
+// Without this the prod auth host answers 401 and the message reads like a broken login
+// rather than a wrong endpoint — and a dev-issued token has been handed to prod on the way.
+func TestClient_RefusesACredentialFromAnotherEnvironment(t *testing.T) {
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+
+	cred := liveCredential()
+	cred.AuthURL = "https://auth-dev.mirador.org"
+	if err := auth.SaveCredential(config.DefaultProfile, cred); err != nil {
+		t.Fatalf("seed credential: %v", err)
+	}
+
+	_, err := New(&config.Config{
+		ProfileName: config.DefaultProfile,
+		APIURL:      "https://api.mirador.org",
+		AuthURL:     "https://auth.mirador.org",
+	}, Options{Version: "test"})
+	if err == nil {
+		t.Fatal("expected a credential from another environment to be refused")
+	}
+
+	var wrongEnv *auth.ErrWrongEnvironment
+	if !errors.As(err, &wrongEnv) {
+		t.Fatalf("expected ErrWrongEnvironment, got %T: %v", err, err)
+	}
+	// Both hosts must appear, or the message does not tell you what to fix.
+	for _, want := range []string{"auth-dev.mirador.org", "auth.mirador.org"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %q, got %v", want, err)
+		}
+	}
+}
+
+// TestClient_AcceptsACredentialFromTheSameEnvironment keeps the guard from being a wall:
+// the ordinary case must be untouched, and credentials written before the field existed
+// carry no host and must still work.
+func TestClient_AcceptsACredentialFromTheSameEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		authURL string
+	}{
+		{"same host", "https://auth.mirador.org"},
+		{"pre-existing credential with no recorded host", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+			cred := liveCredential()
+			cred.AuthURL = tc.authURL
+			if err := auth.SaveCredential(config.DefaultProfile, cred); err != nil {
+				t.Fatalf("seed credential: %v", err)
+			}
+			if _, err := New(&config.Config{
+				ProfileName: config.DefaultProfile,
+				APIURL:      "https://api.mirador.org",
+				AuthURL:     "https://auth.mirador.org",
+			}, Options{Version: "test"}); err != nil {
+				t.Fatalf("New: %v", err)
+			}
+		})
+	}
+}
+
+// TestClient_StampsTheIssuingHostOnLogin is what makes the guard above possible.
+func TestClient_StampsTheIssuingHostOnLogin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "mir_cli_x", "refresh_token": "mir_clr_x",
+			"token_type": "Bearer", "expires_in": 3600,
+			"organization": map[string]string{"id": "org-1"},
+		})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+	client := NewAnonymous(srv.URL, "test")
+
+	cred, err := client.ExchangeCode(context.Background(), "mir_cod_x", "verifier", 54321)
+	if err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if cred.AuthURL != srv.URL {
+		t.Errorf("AuthURL = %q, want the host that minted it (%q)", cred.AuthURL, srv.URL)
 	}
 }

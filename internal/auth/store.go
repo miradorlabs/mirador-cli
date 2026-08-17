@@ -22,12 +22,38 @@ var ErrNotLoggedIn = errors.New("not logged in")
 // expiry, tracked so the CLI can refresh proactively instead of discovering the
 // expiry as a failed request.
 type Credential struct {
-	AccessToken    string    `json:"access_token"`
-	RefreshToken   string    `json:"refresh_token"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	SessionID      string    `json:"session_id,omitempty"`
-	OrganizationID string    `json:"organization_id,omitempty"`
-	UserEmail      string    `json:"user_email,omitempty"`
+	AccessToken  string    `json:"access_token"`
+	RefreshToken string    `json:"refresh_token"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	SessionID    string    `json:"session_id,omitempty"`
+	// AuthURL records the host that minted this credential. A token is only valid to
+	// the environment that issued it, so sending one somewhere else is never useful —
+	// and the 401 it earns looks like a broken login rather than a wrong endpoint.
+	// Empty on credentials written before this field existed; those are not checked.
+	AuthURL        string `json:"auth_url,omitempty"`
+	OrganizationID string `json:"organization_id,omitempty"`
+	UserEmail      string `json:"user_email,omitempty"`
+}
+
+// ErrWrongEnvironment reports a credential issued by a different auth host than the
+// one currently configured.
+type ErrWrongEnvironment struct {
+	IssuedBy     string
+	ConfiguredAs string
+}
+
+func (e *ErrWrongEnvironment) Error() string {
+	return fmt.Sprintf(
+		"this profile is logged in against %s but is now pointed at %s — run `mirador login` for this environment, or switch profiles with `mirador config use <profile>`",
+		e.IssuedBy, e.ConfiguredAs)
+}
+
+// CheckEnvironment reports whether the credential belongs to authURL.
+func (c *Credential) CheckEnvironment(authURL string) error {
+	if c.AuthURL == "" || authURL == "" || c.AuthURL == authURL {
+		return nil
+	}
+	return &ErrWrongEnvironment{IssuedBy: c.AuthURL, ConfiguredAs: authURL}
 }
 
 // Expired reports whether the access token is spent. The skew means a token that

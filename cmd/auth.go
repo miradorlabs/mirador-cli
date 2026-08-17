@@ -74,7 +74,8 @@ projects afterwards without logging in again.`,
 			if who == "" {
 				who = "your account"
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "\nLogged in as %s in %s.\n", who, displayOrg(orgName, cred.OrganizationID))
+			fmt.Fprintf(cmd.OutOrStdout(), "\nLogged in as %s in %s (%s).\n",
+				who, displayOrg(orgName, cred.OrganizationID), cfg.Environment)
 			fmt.Fprintln(cmd.OutOrStdout(), "Next: `mirador project list` to see what you can read.")
 			return nil
 		},
@@ -157,6 +158,7 @@ func newWhoamiCommand() *cobra.Command {
 
 			pairs := [][2]string{
 				{"profile", cfg.ProfileName},
+				{"environment", cfg.Environment},
 				{"api", cfg.APIURL},
 				{"auth endpoint", cfg.AuthURL},
 				{"auth", identity.AuthType},

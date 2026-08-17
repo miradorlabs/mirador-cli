@@ -55,7 +55,7 @@ func (c *Client) ExchangeCode(ctx context.Context, code, verifier string, port i
 	if err != nil {
 		return nil, err
 	}
-	cred := credentialFrom(resp)
+	cred := c.credentialFrom(resp)
 	c.mu.Lock()
 	c.lastLogin = &LoginResult{
 		Credential:       cred,
@@ -93,6 +93,12 @@ func (c *Client) postToken(ctx context.Context, body tokenRequest) (*tokenRespon
 		return nil, errors.New("token endpoint returned no access token")
 	}
 	return &out, nil
+}
+
+func (c *Client) credentialFrom(resp *tokenResponse) *auth.Credential {
+	cred := credentialFrom(resp)
+	cred.AuthURL = c.authURL
+	return cred
 }
 
 func credentialFrom(resp *tokenResponse) *auth.Credential {
@@ -142,7 +148,7 @@ func (c *Client) refresh(ctx context.Context) error {
 		return err
 	}
 
-	cred := credentialFrom(resp)
+	cred := c.credentialFrom(resp)
 	c.mu.Lock()
 	c.credential = cred
 	c.mu.Unlock()

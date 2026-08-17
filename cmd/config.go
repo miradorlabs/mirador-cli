@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -13,6 +14,7 @@ import (
 // field for the API key — only a description of which credential type is in play.
 type configView struct {
 	Profile          string `json:"profile"`
+	Environment      string `json:"environment"`
 	ConfigFile       string `json:"config_file"`
 	APIURL           string `json:"api_url"`
 	AuthURL          string `json:"auth_url"`
@@ -33,7 +35,7 @@ stack and production, or two organizations you move between.
 
 Credentials are stored per profile too, so switching profiles switches identity.`,
 	}
-	cmd.AddCommand(newConfigShowCommand(), newConfigProfilesCommand(), newConfigUseCommand(), newConfigSetCommand())
+	cmd.AddCommand(newConfigShowCommand(), newConfigProfilesCommand(), newConfigUseCommand(), newConfigSetCommand(), newConfigEnvsCommand())
 	return cmd
 }
 
@@ -66,6 +68,7 @@ func newConfigShowCommand() *cobra.Command {
 			// credential itself.
 			view := configView{
 				Profile:          cfg.ProfileName,
+				Environment:      cfg.Environment,
 				ConfigFile:       path,
 				APIURL:           cfg.APIURL,
 				AuthURL:          cfg.AuthURL,
@@ -79,6 +82,7 @@ func newConfigShowCommand() *cobra.Command {
 
 			return output.KeyValues(cmd.OutOrStdout(), format, [][2]string{
 				{"profile", cfg.ProfileName},
+				{"environment", cfg.Environment},
 				{"config file", path},
 				{"api url", cfg.APIURL},
 				{"auth url", cfg.AuthURL},
@@ -113,11 +117,15 @@ func newConfigProfilesCommand() *cobra.Command {
 				if name == file.ActiveProfile {
 					marker = "*"
 				}
-				rows = append(rows, []string{marker, name, p.APIURL, p.ProjectName})
+				envName := p.Environment
+				if envName == "" {
+					envName = config.DefaultEnvironment
+				}
+				rows = append(rows, []string{marker, name, envName, p.ProjectName})
 			}
 
 			return output.Render(cmd.OutOrStdout(), format, output.Table{
-				Headers: []string{"", "PROFILE", "API URL", "PROJECT"},
+				Headers: []string{"", "PROFILE", "ENVIRONMENT", "PROJECT"},
 				Rows:    rows,
 			}, file)
 		},
@@ -150,7 +158,41 @@ func newConfigUseCommand() *cobra.Command {
 	}
 }
 
+func newConfigEnvsCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:     "envs",
+		Aliases: []string{"environments"},
+		Short:   "List the built-in environments",
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			format, err := resolveFormat()
+			if err != nil {
+				return err
+			}
+
+			envs := config.Environments()
+			rows := make([][]string, 0, len(envs))
+			for _, e := range envs {
+				marker := " "
+				if e.Name == cfg.Environment {
+					marker = "*"
+				}
+				rows = append(rows, []string{marker, e.Name, e.AuthURL, e.APIURL, e.AppURL})
+			}
+			return output.Render(cmd.OutOrStdout(), format, output.Table{
+				Headers: []string{"", "NAME", "AUTH", "API", "APP"},
+				Rows:    rows,
+			}, envs)
+		},
+	}
+}
+
 func newConfigSetCommand() *cobra.Command {
+	var env string
 	var apiURL, authURL, appURL string
 
 	cmd := &cobra.Command{
@@ -158,14 +200,26 @@ func newConfigSetCommand() *cobra.Command {
 		Short: "Set endpoints on the active profile",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if apiURL == "" && authURL == "" && appURL == "" {
-				return fmt.Errorf("nothing to set — pass --api-url, --auth-url and/or --app-url")
+			if env == "" && apiURL == "" && authURL == "" && appURL == "" {
+				return fmt.Errorf("nothing to set — pass --env, or --api-url / --auth-url / --app-url")
+			}
+			if env != "" {
+				if _, err := config.LookupEnvironment(env); err != nil {
+					return err
+				}
 			}
 			cfg, err := loadConfig()
 			if err != nil {
 				return err
 			}
 			if err := config.UpdateProfile(cfg.ProfileName, func(p *config.Profile) {
+				if env != "" {
+					p.Environment = env
+					// Clear any stored per-URL overrides: they outrank the environment,
+					// so leaving them would silently defeat the switch the user just asked
+					// for. Anything still wanted can be re-set in the same command.
+					p.APIURL, p.AuthURL, p.AppURL = "", "", ""
+				}
 				if apiURL != "" {
 					p.APIURL = apiURL
 				}
@@ -183,6 +237,7 @@ func newConfigSetCommand() *cobra.Command {
 		},
 	}
 
+	cmd.Flags().StringVar(&env, "env", "", "environment preset: "+strings.Join(config.EnvironmentNames(), ", "))
 	cmd.Flags().StringVar(&apiURL, "api-url", "", "Mirador data API base URL")
 	cmd.Flags().StringVar(&authURL, "auth-url", "", "Mirador auth API base URL")
 	cmd.Flags().StringVar(&appURL, "app-url", "", "Mirador app base URL")

@@ -70,8 +70,17 @@ func TestLoad_FallsBackToDefaultsWithNoConfigFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load must succeed before the first login: %v", err)
 	}
-	if cfg.APIURL != DefaultAPIURL {
-		t.Errorf("APIURL = %q, want %q", cfg.APIURL, DefaultAPIURL)
+	prod, err := LookupEnvironment(DefaultEnvironment)
+	if err != nil {
+		t.Fatalf("LookupEnvironment: %v", err)
+	}
+	if cfg.APIURL != prod.APIURL {
+		t.Errorf("APIURL = %q, want the prod default %q", cfg.APIURL, prod.APIURL)
+	}
+	// Production must be what you get without asking — most people running this are not
+	// developers of it.
+	if cfg.Environment != "prod" {
+		t.Errorf("Environment = %q, want prod", cfg.Environment)
 	}
 	if cfg.ProfileName != DefaultProfile {
 		t.Errorf("ProfileName = %q, want %q", cfg.ProfileName, DefaultProfile)
@@ -203,4 +212,113 @@ func TestLoad_RejectsNonHTTPSchemes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLoad_EnvironmentSelectsAllThreeEndpoints is the point of named environments: the
+// three hosts are only meaningful as a set, and picking them one at a time is how you
+// end up authenticating against prod while reading dev.
+func TestLoad_EnvironmentSelectsAllThreeEndpoints(t *testing.T) {
+	seedConfig(t, nil)
+
+	for _, name := range []string{"dev", "local", "prod"} {
+		t.Run(name, func(t *testing.T) {
+			want, err := LookupEnvironment(name)
+			if err != nil {
+				t.Fatalf("LookupEnvironment: %v", err)
+			}
+			cfg, err := Load(Overrides{Environment: name})
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.APIURL != want.APIURL || cfg.AuthURL != want.AuthURL || cfg.AppURL != want.AppURL {
+				t.Errorf("endpoints = %s / %s / %s, want %s / %s / %s",
+					cfg.APIURL, cfg.AuthURL, cfg.AppURL, want.APIURL, want.AuthURL, want.AppURL)
+			}
+			if cfg.Environment != want.Name {
+				t.Errorf("Environment = %q, want %q", cfg.Environment, want.Name)
+			}
+		})
+	}
+}
+
+// TestLoad_ExplicitURLBeatsEnvironment keeps the escape hatch working: an environment is
+// a baseline, not a cage — a dev pointing one host at a laptop must not have to abandon
+// the preset for the other two.
+func TestLoad_ExplicitURLBeatsEnvironment(t *testing.T) {
+	seedConfig(t, nil)
+
+	dev, _ := LookupEnvironment("dev")
+	cfg, err := Load(Overrides{Environment: "dev", APIURL: "http://localhost:8055"})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.APIURL != "http://localhost:8055" {
+		t.Errorf("APIURL = %q, want the explicit override", cfg.APIURL)
+	}
+	if cfg.AuthURL != dev.AuthURL {
+		t.Errorf("AuthURL = %q, want dev's %q — overriding one host must not reset the others", cfg.AuthURL, dev.AuthURL)
+	}
+}
+
+func TestLoad_EnvironmentPrecedence(t *testing.T) {
+	seedConfig(t, &File{
+		ActiveProfile: DefaultProfile,
+		Profiles:      map[string]*Profile{DefaultProfile: {Environment: "dev"}},
+	})
+
+	t.Run("profile selects it", func(t *testing.T) {
+		cfg, err := Load(Overrides{})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Environment != "dev" {
+			t.Errorf("Environment = %q, want dev from the profile", cfg.Environment)
+		}
+	})
+
+	t.Run("MIRADOR_ENV beats the profile", func(t *testing.T) {
+		t.Setenv("MIRADOR_ENV", "local")
+		cfg, err := Load(Overrides{})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Environment != "local" {
+			t.Errorf("Environment = %q, want local", cfg.Environment)
+		}
+	})
+
+	t.Run("the flag beats MIRADOR_ENV", func(t *testing.T) {
+		t.Setenv("MIRADOR_ENV", "local")
+		cfg, err := Load(Overrides{Environment: "prod"})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Environment != "prod" {
+			t.Errorf("Environment = %q, want prod", cfg.Environment)
+		}
+	})
+}
+
+func TestLookupEnvironment(t *testing.T) {
+	t.Run("aliases resolve", func(t *testing.T) {
+		// `prd` is what the platform's own charts call production; nobody should have to
+		// remember that this tool spells it differently.
+		for _, alias := range []string{"prd", "PROD", " production ", "Localhost"} {
+			if _, err := LookupEnvironment(alias); err != nil {
+				t.Errorf("LookupEnvironment(%q): %v", alias, err)
+			}
+		}
+	})
+
+	t.Run("unknown names list the options", func(t *testing.T) {
+		_, err := Load(Overrides{Environment: "staging"})
+		if err == nil {
+			t.Fatal("expected an unknown environment to be rejected")
+		}
+		for _, want := range []string{"dev", "local", "prod"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error should list %q, got %v", want, err)
+			}
+		}
+	})
 }

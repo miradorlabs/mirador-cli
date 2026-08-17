@@ -22,10 +22,6 @@ import (
 const (
 	DefaultProfile = "default"
 
-	DefaultAPIURL  = "https://api.mirador.org"
-	DefaultAuthURL = "https://auth.mirador.org"
-	DefaultAppURL  = "https://app.mirador.org"
-
 	configFileName      = "config.json"
 	credentialsFileName = "credentials.json"
 	dirName             = ".mirador"
@@ -33,6 +29,9 @@ const (
 
 // Profile is the non-secret half of a profile: where to talk to and what is selected.
 type Profile struct {
+	// Environment names a built-in endpoint set. Individual URLs below still win,
+	// so a profile can start from `dev` and override one host.
+	Environment      string `json:"environment,omitempty"`
 	APIURL           string `json:"api_url,omitempty"`
 	AuthURL          string `json:"auth_url,omitempty"`
 	AppURL           string `json:"app_url,omitempty"`
@@ -50,6 +49,9 @@ type File struct {
 // Config is the fully resolved view a command works against.
 type Config struct {
 	ProfileName string
+	// Environment is the resolved endpoint set: prod unless something selected
+	// otherwise. Reported by `config show` and `whoami` so it is never a guess.
+	Environment string
 	// APIURL is the data plane (traces, logs, metrics, dashboards). AuthURL is the
 	// credential surface — separate hosts, so an auth outage cannot take reads down.
 	APIURL  string
@@ -72,11 +74,12 @@ type Config struct {
 
 // Overrides are the flag values that win over everything else.
 type Overrides struct {
-	Profile   string
-	APIURL    string
-	AuthURL   string
-	AppURL    string
-	ProjectID string
+	Profile     string
+	Environment string
+	APIURL      string
+	AuthURL     string
+	AppURL      string
+	ProjectID   string
 }
 
 // Load resolves settings in precedence order: flag, environment, active profile,
@@ -93,11 +96,21 @@ func Load(o Overrides) (*Config, error) {
 		profile = &Profile{}
 	}
 
+	// The environment supplies the baseline endpoints; explicit URLs override one at a
+	// time. Selecting it before the URLs is what lets `--env dev` move all three hosts
+	// together while still allowing a single host to be pointed elsewhere.
+	envName := firstNonEmpty(o.Environment, os.Getenv("MIRADOR_ENV"), profile.Environment, DefaultEnvironment)
+	env, err := LookupEnvironment(envName)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		ProfileName:      name,
-		APIURL:           strings.TrimRight(firstNonEmpty(o.APIURL, os.Getenv("MIRADOR_API_URL"), profile.APIURL, DefaultAPIURL), "/"),
-		AuthURL:          strings.TrimRight(firstNonEmpty(o.AuthURL, os.Getenv("MIRADOR_AUTH_URL"), profile.AuthURL, DefaultAuthURL), "/"),
-		AppURL:           strings.TrimRight(firstNonEmpty(o.AppURL, os.Getenv("MIRADOR_APP_URL"), profile.AppURL, DefaultAppURL), "/"),
+		Environment:      env.Name,
+		APIURL:           strings.TrimRight(firstNonEmpty(o.APIURL, os.Getenv("MIRADOR_API_URL"), profile.APIURL, env.APIURL), "/"),
+		AuthURL:          strings.TrimRight(firstNonEmpty(o.AuthURL, os.Getenv("MIRADOR_AUTH_URL"), profile.AuthURL, env.AuthURL), "/"),
+		AppURL:           strings.TrimRight(firstNonEmpty(o.AppURL, os.Getenv("MIRADOR_APP_URL"), profile.AppURL, env.AppURL), "/"),
 		OrganizationID:   firstNonEmpty(os.Getenv("MIRADOR_ORGANIZATION_ID"), profile.OrganizationID),
 		OrganizationName: profile.OrganizationName,
 		ProjectID:        firstNonEmpty(o.ProjectID, os.Getenv("MIRADOR_PROJECT_ID"), profile.ProjectID),
