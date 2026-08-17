@@ -179,6 +179,79 @@ make build
 The auth flow, credential handling, config precedence, and project matching are covered by
 `go test ./...`; the login test drives the real loopback listener end to end.
 
+## Testing against a local stack
+
+`go test` covers the CLI in isolation. To exercise the whole login flow — CLI, auth gateway,
+API gateway, the frontend BFF, the web gateway and account-api, all real — run the stack
+locally. No deploy required.
+
+**1. Patch the unreleased proto stubs into the frontend.** The web-gateway npm package only
+publishes on merge to `main`, so a branch that adds an RPC cannot be run against until then:
+
+```bash
+cd ../mirador-platform && ./scripts/build/generate-gateway-stubs-local.sh
+```
+
+**2. Boot the platform.** Clerk is switched off so the HMAC test verifier can stand in for a
+browser session — the gateway *refuses* to start in HMAC mode with `CLERK_SECRET_KEY` set, so
+this can never be pointed at a real environment by accident:
+
+```bash
+cd ../mirador-platform
+docker build -f build/fullstack/Dockerfile -t mirador-platform:latest .
+docker run -d --name mirador-local --env-file .env \
+  -e MIRADOR_TEMPLATE=mirador-local \
+  -e CLERK_SECRET_KEY= \
+  -e WEB_GATEWAY_TOKEN_VERIFIER=hmac \
+  -e WEB_GATEWAY_HMAC_SECRET=test-jwt-secret-for-integration-tests \
+  -e WEB_GATEWAY_HMAC_ISSUER=mirador-integration-tests \
+  -e WEB_GATEWAY_HMAC_AUDIENCE=mirador-web-gateway \
+  -e METRIC_OTLP_ENDPOINT= \
+  -p 8051:8051 -p 8052:8052 -p 8055:8055 -p 8057:8057 -p 9092:9092 -p 9000:9000 -p 8123:8123 \
+  mirador-platform:latest
+
+# Kafka and ClickHouse make this slow; wait for both gateways rather than guessing.
+until curl -sf localhost:8057/health && curl -sf localhost:8055/health; do sleep 5; done
+```
+
+**3. Seed an identity.** `POST /api/logon` auto-provisions, but only via Clerk — which is off.
+Seeding an existing user skips that path:
+
+```bash
+cd ../mirador-cli && ./scripts/local-seed.sh
+```
+
+**4. Start the frontend BFF.** `GRPC_USE_SSL=false` because the local gateway is plaintext, and
+the pnpm flag skips a dependency gate that fails while the stub version is unpublished:
+
+```bash
+cd ../mirador-frontend
+GRPC_BASE_URL_WEB=localhost:8052 GRPC_USE_SSL=false PORT=3001 \
+  pnpm --config.verify-deps-before-run=false server:dev
+```
+
+**5. Run the flow.**
+
+```bash
+cd ../mirador-cli && make build && ./scripts/local-e2e.sh
+```
+
+It drives login through the same Express endpoint the `/cli/auth` page calls, then performs the
+same loopback redirect, and asserts credential file permissions, project scoping, cross-tenant
+denial, silent refresh, and revoke-on-logout.
+
+To drive it by hand instead, point the CLI at the local hosts — `http` is accepted for loopback
+only:
+
+```bash
+export MIRADOR_AUTH_URL=http://localhost:8057 \
+       MIRADOR_API_URL=http://localhost:8055 \
+       MIRADOR_APP_URL=http://localhost:3000
+./bin/mirador login --no-browser
+```
+
+**Tear down:** `docker rm -f mirador-local`.
+
 ## Contract
 
 `CONTRACT.md` is the normative description of the auth flow and the API surface it depends

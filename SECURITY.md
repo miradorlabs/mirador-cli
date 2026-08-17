@@ -13,8 +13,14 @@ argued with — if a claim here is wrong, that is a bug.
 | PKCE verifier | one login | process memory only | Useless without the code |
 | Server key `mir_srv_` | until revoked | `MIRADOR_API_KEY` env | Read the one project it is bound to |
 
-A CLI credential is **org-scoped and read-only**. It cannot write, cannot create keys, and
-cannot reach another organization.
+A CLI credential is **org-scoped**: it reaches every project in one organization and no
+other organization. It cannot mint API keys or other credentials.
+
+It is **not read-only**. The data API carries a few conditional writes — dashboards, and
+(since the metric-alerts surface landed) `PUT`/`DELETE /v1/metric-alerts/{slug}` — and a CLI
+token can reach them. Those writes are attributed to the real user id rather than a key id,
+so the audit trail names a person; but a leaked token can modify alerting, not just read it.
+The CLI deliberately exposes no command for them, which limits accident, not intent.
 
 ## The login flow, and what each control is for
 
