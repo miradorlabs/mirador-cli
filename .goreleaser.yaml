@@ -84,7 +84,11 @@ homebrew_casks:
         install: |
           # Downloaded binaries carry macOS's quarantine flag, which Gatekeeper blocks
           # with an unhelpful "cannot be opened" until the attribute is cleared. Homebrew
-          # runs this after install so the first `mirador` works.
-          if system_command("/usr/bin/xattr", args: ["-h"], print_stderr: false).exit_status == 0
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/mirador"]
+          # runs this after install so the first `mirador` works. Linux has no xattr
+          # binary, and system_command raises rather than returning non-zero when the
+          # executable is missing, so this must be a file check and not a probe.
+          if File.executable?("/usr/bin/xattr")
+            system_command "/usr/bin/xattr",
+                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/mirador"],
+                           print_stderr: false
           end
