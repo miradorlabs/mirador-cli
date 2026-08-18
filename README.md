@@ -3,7 +3,7 @@
 The command-line client for the [Mirador](https://mirador.org) API — traces, OpenTelemetry
 logs, PromQL metrics, and dashboards, from your terminal.
 
-```
+```console
 $ mirador login
 Opening your browser to authorize the CLI.
 Waiting for authorization...
@@ -24,15 +24,51 @@ $ mirador trace list --filter 'status="running"' --since 1h
 
 ## Install
 
+### Homebrew (macOS and Linux)
+
 ```bash
-go install github.com/miradorlabs/mirador-cli@latest
+brew install miradorlabs/tap/mirador
+mirador --version
 ```
 
-Or build from source:
+Upgrades are `brew upgrade mirador`.
+
+### Direct download
+
+Every release publishes static binaries for macOS, Linux and Windows on
+[Releases](https://github.com/miradorlabs/mirador-cli/releases), with a `checksums.txt`
+alongside them:
 
 ```bash
-make build      # → bin/mirador
-make dist       # cross-compiled release binaries
+VERSION=v0.1.0
+OS=$(uname -s)            # Darwin | Linux
+ARCH=$(uname -m)          # arm64 | x86_64
+curl -sSL -o mirador.tar.gz \
+  "https://github.com/miradorlabs/mirador-cli/releases/download/${VERSION}/mirador_${OS}_${ARCH}.tar.gz"
+tar -xzf mirador.tar.gz mirador
+sudo mv mirador /usr/local/bin/
+```
+
+CGO is off, so the binary is static — no matching libc required.
+
+### From source
+
+```bash
+make install    # → $(go env GOPATH)/bin/mirador, on your PATH
+make build      # → ./bin/mirador, for hacking on it
+```
+
+`make install` places the binary explicitly rather than using `go install`, which would
+name it `mirador-cli` after the module path.
+
+### Shell completions
+
+Homebrew wires these up automatically. Otherwise:
+
+```bash
+mirador completion zsh  > "${fpath[1]}/_mirador"          # zsh
+mirador completion bash > /etc/bash_completion.d/mirador  # bash
+mirador completion fish > ~/.config/fish/completions/mirador.fish
 ```
 
 ## Endpoints and environments
@@ -286,6 +322,31 @@ so this preset is the one place cleartext is allowed:
 ```
 
 **Tear down:** `docker rm -f mirador-local`.
+
+## Releasing
+
+Tagging is the whole process — `.github/workflows/release.yml` runs GoReleaser, which
+builds every platform, publishes the GitHub Release, and pushes the Homebrew cask.
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+make release-dry-run   # build the archives locally first, publishing nothing
+```
+
+Two things must exist before the first release:
+
+1. **`miradorlabs/homebrew-tap`** — a repo with a `Casks/` directory. GoReleaser commits
+   `Casks/mirador.rb` into it; Homebrew needs nothing else to serve
+   `brew install miradorlabs/tap/mirador`.
+2. **`HOMEBREW_TAP_TOKEN`** — a repository secret holding a PAT with `contents:write` on
+   the tap. The workflow's default `GITHUB_TOKEN` is scoped to this repo and cannot push
+   there. Without it the release still publishes and only the tap update fails, so a
+   missing token costs you a re-run, not a broken release.
+
+While this repo is private, `brew install` needs the tap public *and* the release assets
+reachable — Homebrew downloads them unauthenticated. Public tap plus private releases will
+fail at download. Until the repo is public, `make install` and direct downloads by
+authenticated users are the working paths.
 
 ## Contract
 

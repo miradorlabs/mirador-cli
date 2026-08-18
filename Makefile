@@ -6,9 +6,13 @@ LDFLAGS := -s -w -X github.com/miradorlabs/mirador-cli/cmd.Version=$(VERSION)
 build:
 	go build -ldflags "$(LDFLAGS)" -o $(BINARY) .
 
+# Install onto PATH as `mirador`. Plain `go install` would name it `mirador-cli`
+# after the module path, so the binary is placed explicitly.
 .PHONY: install
 install:
-	go install -ldflags "$(LDFLAGS)" .
+	go build -ldflags "$(LDFLAGS)" -o "$(shell go env GOPATH)/bin/mirador" .
+	@echo "installed $(shell go env GOPATH)/bin/mirador"
+	@command -v mirador >/dev/null 2>&1 || echo "note: $(shell go env GOPATH)/bin is not on your PATH"
 
 .PHONY: test
 test:
@@ -28,6 +32,11 @@ vet:
 
 .PHONY: check
 check: fmt vet test
+
+# Build the release archives locally without publishing — same path CI takes.
+.PHONY: release-dry-run
+release-dry-run:
+	go run github.com/goreleaser/goreleaser/v2@latest release --snapshot --clean --skip=publish
 
 .PHONY: clean
 clean:
