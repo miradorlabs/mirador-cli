@@ -352,3 +352,9 @@ authenticated users are the working paths.
 
 `CONTRACT.md` is the normative description of the auth flow and the API surface it depends
 on — the shared reference for this CLI, the API gateway, and the browser approval page.
+
+## License
+
+MIT — see `LICENSE`. Note that `mirador-platform` is licensed differently (FSL-1.1); this
+CLI matches the SDKs, since like them it is client-side code you are expected to install
+and build against.
