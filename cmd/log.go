@@ -36,7 +36,7 @@ func newLogCommand() *cobra.Command {
 		Aliases: []string{"logs"},
 		Short:   "Query OpenTelemetry logs",
 	}
-	cmd.AddCommand(newLogQueryCommand(), newLogStatsCommand())
+	cmd.AddCommand(newLogQueryCommand(), newLogStatsCommand(), newLogAttributesCommand(), newLogTailCommand())
 	return cmd
 }
 

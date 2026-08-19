@@ -41,7 +41,7 @@ func newTraceCommand() *cobra.Command {
 		Aliases: []string{"traces"},
 		Short:   "Query traces",
 	}
-	cmd.AddCommand(newTraceListCommand(), newTraceGetCommand(), newTraceEventsCommand(), newTraceTagsCommand())
+	cmd.AddCommand(newTraceListCommand(), newTraceGetCommand(), newTraceEventsCommand(), newTraceTagsCommand(), newTraceAttributesCommand())
 	return cmd
 }
 

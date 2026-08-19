@@ -173,6 +173,39 @@ token — empty when none was sent, which is not the same as "no project exists"
 }
 ```
 
+## Conditional writes (API gateway)
+
+Dashboards, metric alerts and derived metrics are slug-addressed documents with an
+identical write contract. The CLI implements it in one place (`cmd/resource.go`) and
+registers it three times.
+
+A `PUT` must carry exactly one precondition — a blind overwrite is never allowed:
+
+| Header | Meaning | Failure |
+|---|---|---|
+| `If-None-Match: *` | create only | 412 if the slug exists |
+| `If-Match: "<etag>"` | replace exactly that revision | 412 if stale, deleted or replaced |
+| neither | — | 428 |
+| both | — | 400 |
+
+`DELETE` requires `If-Match`; a missing one is 428.
+
+`mirador <resource> apply` therefore reads before it writes: a 404 becomes a create,
+and a successful read supplies the ETag for a replace. That read-then-write window is
+the point rather than a flaw — a concurrent change makes the write 412, which the CLI
+reports as *"changed since it was read"* instead of silently discarding the other
+edit. `--etag` skips the read when the caller already knows the revision, and
+`--create` asserts the resource is new.
+
+The slug lives in the URL and never in the body: every `*Input` schema is
+`additionalProperties: false`, so a document containing `slug:` would be rejected.
+The CLI strips it after using it as the identity, which is what lets a file be
+self-describing.
+
+A replace whose body matches the stored document is a no-op — same revision, same
+ETag — so re-applying a directory of definitions from CI is safe.
+
+
 ## Per-request project scoping
 
 Under a CLI token every project-scoped endpoint requires the project to be named explicitly:

@@ -75,7 +75,7 @@ func (c *Client) LastLogin() *LoginResult {
 }
 
 func (c *Client) postToken(ctx context.Context, body tokenRequest) (*tokenResponse, error) {
-	resp, err := c.attempt(ctx, authHost, http.MethodPost, tokenPath, nil, body)
+	resp, err := c.attempt(ctx, authHost, http.MethodPost, tokenPath, nil, nil, body)
 	if err != nil {
 		return nil, err
 	}

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -149,32 +150,109 @@ func (c *Client) Credential() *auth.Credential {
 
 // Get and Post address the data plane.
 func (c *Client) Get(ctx context.Context, path string, query url.Values, out any) error {
-	return c.do(ctx, dataHost, http.MethodGet, path, query, nil, out)
+	_, err := c.do(ctx, dataHost, http.MethodGet, path, query, nil, nil, out)
+	return err
 }
 
 func (c *Client) Post(ctx context.Context, path string, body, out any) error {
-	return c.do(ctx, dataHost, http.MethodPost, path, nil, body, out)
+	_, err := c.do(ctx, dataHost, http.MethodPost, path, nil, nil, body, out)
+	return err
+}
+
+// Meta carries the parts of a response the conditional-write endpoints make
+// load-bearing: the ETag that authorizes the next write, and the status that
+// distinguishes a create from a replace.
+type Meta struct {
+	StatusCode int
+	ETag       string
+}
+
+// Created reports whether a PUT allocated a new resource rather than replacing one.
+func (m *Meta) Created() bool { return m != nil && m.StatusCode == http.StatusCreated }
+
+// ErrNotFound is the sentinel for a 404, which apply treats as "create instead of
+// replace" rather than as a failure.
+func IsNotFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
+}
+
+// IsPreconditionFailed reports a 412: the resource changed between the read that
+// produced the ETag and the write that presented it.
+func IsPreconditionFailed(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusPreconditionFailed
+}
+
+// GetWithMeta is Get plus the ETag, which a later Put or Delete must present.
+func (c *Client) GetWithMeta(ctx context.Context, path string, query url.Values, out any) (*Meta, error) {
+	return c.do(ctx, dataHost, http.MethodGet, path, query, nil, nil, out)
+}
+
+// Precondition is the conditional header a write carries. The gateway requires
+// exactly one: a write with neither is 428 and a write with both is 400, so this is
+// modelled as one choice rather than two independent fields.
+type Precondition struct {
+	// CreateOnly sends `If-None-Match: *` — succeed only if the slug is unused.
+	CreateOnly bool
+	// ReplaceETag sends `If-Match: <etag>` — succeed only against that exact revision.
+	ReplaceETag string
+}
+
+func (p Precondition) header() (string, string, error) {
+	switch {
+	case p.CreateOnly && p.ReplaceETag != "":
+		return "", "", errors.New("a write is either a create or a replace, not both")
+	case p.CreateOnly:
+		return "If-None-Match", "*", nil
+	case p.ReplaceETag != "":
+		return "If-Match", p.ReplaceETag, nil
+	default:
+		// Caught here rather than at the gateway so the message names the CLI's own
+		// flags instead of returning a bare 428.
+		return "", "", errors.New("a write needs a precondition: --create to add, or a prior read's etag to replace")
+	}
+}
+
+// Put performs the conditional full-document write the resource endpoints require.
+func (c *Client) Put(ctx context.Context, path string, pre Precondition, body, out any) (*Meta, error) {
+	name, value, err := pre.header()
+	if err != nil {
+		return nil, err
+	}
+	return c.do(ctx, dataHost, http.MethodPut, path, nil, http.Header{name: []string{value}}, body, out)
+}
+
+// Delete removes a resource, and only the revision the ETag names.
+func (c *Client) Delete(ctx context.Context, path, etag string) error {
+	if etag == "" {
+		return errors.New("delete needs the etag of the revision to remove")
+	}
+	_, err := c.do(ctx, dataHost, http.MethodDelete, path, nil, http.Header{"If-Match": []string{etag}}, nil, nil)
+	return err
 }
 
 // AuthGet and AuthPost address the credential surface.
 func (c *Client) AuthGet(ctx context.Context, path string, query url.Values, out any) error {
-	return c.do(ctx, authHost, http.MethodGet, path, query, nil, out)
+	_, err := c.do(ctx, authHost, http.MethodGet, path, query, nil, nil, out)
+	return err
 }
 
 func (c *Client) AuthPost(ctx context.Context, path string, body, out any) error {
-	return c.do(ctx, authHost, http.MethodPost, path, nil, body, out)
+	_, err := c.do(ctx, authHost, http.MethodPost, path, nil, nil, body, out)
+	return err
 }
 
-func (c *Client) do(ctx context.Context, h host, method, path string, query url.Values, body, out any) error {
+func (c *Client) do(ctx context.Context, h host, method, path string, query url.Values, headers http.Header, body, out any) (*Meta, error) {
 	// Refresh before the first attempt when the token is known-expired, so the common
 	// case costs one round trip rather than a guaranteed 401 followed by a retry.
 	if err := c.refreshIfNeeded(ctx); err != nil {
-		return err
+		return nil, err
 	}
 
-	resp, err := c.attempt(ctx, h, method, path, query, body)
+	resp, err := c.attempt(ctx, h, method, path, query, headers, body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// A 401 on a token we believed was live means it was revoked or rotated
@@ -182,19 +260,36 @@ func (c *Client) do(ctx context.Context, h host, method, path string, query url.
 	if resp.StatusCode == http.StatusUnauthorized && c.canRefresh() {
 		resp.Body.Close()
 		if refreshErr := c.refresh(ctx); refreshErr != nil {
-			return refreshErr
+			return nil, refreshErr
 		}
-		resp, err = c.attempt(ctx, h, method, path, query, body)
+		resp, err = c.attempt(ctx, h, method, path, query, headers, body)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	defer resp.Body.Close()
 
-	return decode(resp, out)
+	meta := &Meta{StatusCode: resp.StatusCode, ETag: resp.Header.Get("ETag")}
+	return meta, decode(resp, out)
 }
 
-func (c *Client) attempt(ctx context.Context, h host, method, path string, query url.Values, body any) (*http.Response, error) {
+func (c *Client) attempt(ctx context.Context, h host, method, path string, query url.Values, headers http.Header, body any) (*http.Response, error) {
+	req, err := c.newRequest(ctx, h, method, path, query, headers, body)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", method, path, err)
+	}
+	return resp, nil
+}
+
+// newRequest builds a fully-authorized request without sending it, so a caller
+// needing different transport settings — the SSE tail, which must not inherit the
+// shared client's request timeout — can reuse the credential and header logic
+// rather than reimplementing it.
+func (c *Client) newRequest(ctx context.Context, h host, method, path string, query url.Values, headers http.Header, body any) (*http.Request, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -218,6 +313,11 @@ func (c *Client) attempt(ctx context.Context, h host, method, path string, query
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	for name, values := range headers {
+		for _, v := range values {
+			req.Header.Add(name, v)
+		}
+	}
 
 	c.mu.Lock()
 	switch {
@@ -235,11 +335,7 @@ func (c *Client) attempt(ctx context.Context, h host, method, path string, query
 		req.Header.Set(projectHeader, c.projectID)
 	}
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", method, path, err)
-	}
-	return resp, nil
+	return req, nil
 }
 
 func decode(resp *http.Response, out any) error {
