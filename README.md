@@ -171,19 +171,65 @@ The selection is stored in the active profile. Every project-scoped request send
 
 ## Commands
 
+The CLI covers the API gateway's full surface — every operation in its OpenAPI
+document has a command, enforced by a test.
+
 | Command | What it does |
 |---|---|
 | `mirador login` / `logout` / `whoami` | Manage and inspect this machine's credential |
 | `mirador project list \| use \| show` | List and select projects |
 | `mirador org list` | Organizations you belong to |
-| `mirador trace list \| get \| events \| tags` | Query traces |
-| `mirador log query \| stats` | Query OpenTelemetry logs |
+| `mirador trace list \| get \| events \| tags \| attributes` | Query traces and discover filterable keys |
+| `mirador log query \| stats \| attributes \| tail` | Query logs, summarize volume, follow live |
 | `mirador metric list \| query \| range` | Explore metrics and run PromQL |
-| `mirador dashboard list \| get` | Read dashboards |
+| `mirador dashboard list \| get \| apply \| delete` | Manage dashboards |
+| `mirador metric-alert list \| get \| apply \| delete` | Manage metric alerts |
+| `mirador derived-metric list \| get \| apply \| delete \| dry-run` | Author derived metrics |
+| `mirador integration list \| get` | Notification channels alerts can name |
 | `mirador config show \| profiles \| use \| set \| envs` | Manage profiles and environments |
 
-Dashboard writes are deliberately absent. They are destructive and ETag-guarded; a mistyped
-CLI argument should not be able to replace a dashboard a team depends on.
+## Managing resources as files
+
+Dashboards, metric alerts and derived metrics share one contract: a slug is the
+identity, and `apply` writes the whole document. Re-applying an unchanged file is a
+no-op, so a directory of definitions is safe to apply from CI on every push.
+
+```bash
+mirador dashboard apply -f dashboards/payments.yaml     # slug read from the file
+mirador metric-alert apply latency -f alerts/latency.yaml
+mirador derived-metric dry-run -f metrics/slippage.yaml  # preview before committing
+mirador derived-metric apply -f metrics/slippage.yaml
+```
+
+The file is YAML or JSON, and carries the resource's own fields. A top-level `slug:`
+names it, so files are self-describing:
+
+```yaml
+slug: payments
+title: Payments
+default_time_window: 24h
+widgets: []
+```
+
+**Writes are conditional, never blind.** `apply` reads the current revision and
+replaces exactly that one; if someone else wrote in between, it fails rather than
+clobbering them. `delete` works the same way. Both accept `--etag` to assert a
+specific revision, and `apply --create` fails if the slug already exists.
+
+Because a replace is a full-document write rather than a patch, an optional field
+omitted from the file is cleared. Start from `mirador <resource> get <slug> -o yaml`
+when editing something that already exists.
+
+## Following logs
+
+```bash
+mirador log tail --filter 'service.name="checkout"' --window 15m
+```
+
+Replays the window, then streams live, reconnecting automatically and resuming from
+the last record it saw. Delivery is best effort: a burst larger than `--page-size`
+drops its middle to stay current, and records can repeat across a reconnect. Use
+`mirador log query` when completeness matters.
 
 ## Output
 

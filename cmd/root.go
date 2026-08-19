@@ -68,6 +68,9 @@ pins one project and skips the browser entirely.`,
 		newLogCommand(),
 		newMetricCommand(),
 		newDashboardCommand(),
+		newMetricAlertCommand(),
+		newDerivedMetricCommand(),
+		newIntegrationCommand(),
 	)
 	return root
 }
