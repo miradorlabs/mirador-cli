@@ -27,9 +27,15 @@ $ mirador trace list --filter 'status="running"' --since 1h
 ### Homebrew (macOS and Linux)
 
 ```bash
-brew install miradorlabs/tap/mirador
+brew tap miradorlabs/tap
+brew trust miradorlabs/tap
+brew install mirador
 mirador --version
 ```
+
+`brew trust` is required once. Homebrew will not load a third-party tap until you
+trust it — formulae and casks are executable Ruby — and reports the tap as untrusted
+rather than installing from it. The choice is recorded in `~/.homebrew/trust.json`.
 
 Upgrades are `brew upgrade mirador`.
 
@@ -313,9 +319,11 @@ make release-dry-run   # build the archives locally first, publishing nothing
 
 Two things must exist before the first release:
 
-1. **`miradorlabs/homebrew-tap`** — a repo with a `Casks/` directory. GoReleaser commits
-   `Casks/mirador.rb` into it; Homebrew needs nothing else to serve
-   `brew install miradorlabs/tap/mirador`.
+1. **`miradorlabs/homebrew-tap`** — the repo must exist, but nothing needs to be in it.
+   GoReleaser commits `Casks/mirador.rb` through the GitHub contents API, which creates
+   the directory on the way; Homebrew needs nothing else to serve
+   `brew install miradorlabs/tap/mirador`. The tap already hosts `hush` as a formula,
+   and the two coexist — different directory, different name.
 2. **`HOMEBREW_TAP_TOKEN`** — a repository secret holding a PAT with `contents:write` on
    the tap. The workflow's default `GITHUB_TOKEN` is scoped to this repo and cannot push
    there. Without it the release still publishes and only the tap update fails, so a
