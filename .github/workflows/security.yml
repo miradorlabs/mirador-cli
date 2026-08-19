@@ -1,0 +1,30 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly: a dependency with no code change of ours can still become vulnerable,
+    # and the push/PR triggers would never notice.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Covers both our dependencies and the Go standard library the binary is built
+      # against — the CLI handles credentials, so a vulnerable crypto/tls or net/http
+      # in the toolchain matters as much as a bad module.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

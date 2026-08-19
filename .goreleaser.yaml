@@ -1,0 +1,94 @@
+version: 2
+
+project_name: mirador
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: mirador
+    main: .
+    # The module is github.com/miradorlabs/mirador-cli, so `go build` would name the
+    # binary `mirador-cli`. Everything a user installs should be `mirador`.
+    binary: mirador
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    # -s -w drops the symbol table and DWARF; the version is the git tag so
+    # `mirador --version` matches the release someone downloaded.
+    ldflags:
+      - -s -w -X github.com/miradorlabs/mirador-cli/cmd.Version={{.Version}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: mirador
+    ids: [mirador]
+    # Homebrew and install scripts both expect <name>_<os>_<arch>.tar.gz.
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - SECURITY.md
+      - LICENSE*
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+# GoReleaser deprecated `brews` (formulae) for CLI binaries in favour of casks.
+homebrew_casks:
+  - name: mirador
+    ids: [mirador]
+    binaries: [mirador]
+    # The tap repo must exist before the first release — see README "Releasing".
+    repository:
+      owner: miradorlabs
+      name: homebrew-tap
+      # A PAT with contents:write on the tap repo. The workflow's default GITHUB_TOKEN is
+      # scoped to *this* repo and cannot push to the tap.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    homepage: https://mirador.org
+    description: Query Mirador traces, logs, metrics, and dashboards from your terminal
+    license: MIT
+    commit_author:
+      name: mirador-bot
+      email: engineering@mirador.org
+    # `mirador <tab>` works the moment it is installed.
+    generate_completions_from_executable:
+      executable: mirador
+      args: [completion]
+    hooks:
+      post:
+        install: |
+          # Downloaded binaries carry macOS's quarantine flag, which Gatekeeper blocks
+          # with an unhelpful "cannot be opened" until the attribute is cleared. Homebrew
+          # runs this after install so the first `mirador` works. Linux has no xattr
+          # binary, and system_command raises rather than returning non-zero when the
+          # executable is missing, so this must be a file check and not a probe.
+          if File.executable?("/usr/bin/xattr")
+            system_command "/usr/bin/xattr",
+                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/mirador"],
+                           print_stderr: false
+          end
