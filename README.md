@@ -297,6 +297,20 @@ make build
 The auth flow, credential handling, config precedence, and project matching are covered by
 `go test ./...`; the login test drives the real loopback listener end to end.
 
+### Editor hooks
+
+`.claude/hooks/` holds two PostToolUse hooks that run on every Go edit, mirroring
+`mirador-platform`: `go-fix.sh` applies the `go fix` modernizers to the edited
+file's package, then `format-go.sh` runs goimports. Registered in
+`.claude/settings.json`, so formatting is enforced rather than remembered.
+
+Both are best-effort by design — a missing tool, a malformed payload, or a
+mid-refactor package that will not compile is a silent no-op. A hook that failed
+would block the edit that triggered it, which is far worse than unformatted code
+that `make check` catches anyway.
+
+`.claude/settings.local.json` is gitignored for per-developer overrides.
+
 ## Testing against a local stack
 
 `go test` covers the CLI in isolation. To exercise the whole login flow — CLI, auth gateway,

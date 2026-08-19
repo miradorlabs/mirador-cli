@@ -3,3 +3,6 @@ dist/
 *.test
 coverage.out
 .DS_Store
+
+# Per-developer Claude Code overrides (permissions etc.)
+.claude/settings.local.json
