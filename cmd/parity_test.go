@@ -8,9 +8,15 @@ import (
 )
 
 // apiOperations is every operation in the API gateway's OpenAPI document, mapped to
-// the command that reaches it. The CLI's stated contract is full parity with that
+// the command that serves it. The CLI's stated contract is full parity with that
 // surface, so this table is the executable form of that claim: an endpoint added to
 // the gateway should fail this test until a command exists for it.
+//
+// This test asserts the command *exists and is runnable*, not that it calls the exact
+// path/host in the key — that mapping is verified by the per-package client tests. One
+// entry is deliberately indirect: `GET /v1/identity` (data plane) is served for the
+// user by `whoami`, which calls the auth host's `/v1/whoami`; the two return the same
+// identity and the CLI exposes no separate command for the data-plane endpoint.
 //
 // Regenerate the left column with:
 //

@@ -152,14 +152,30 @@ func validateEndpoint(name, raw string) error {
 }
 
 func isLoopbackHost(host string) bool {
-	if host == "localhost" {
-		return true
-	}
 	// Covers 127.0.0.0/8 and ::1, not just the literal 127.0.0.1 a check on the string would.
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.IsLoopback()
 	}
-	return false
+	if host != "localhost" {
+		return false
+	}
+	// "localhost" is conventionally loopback, but /etc/hosts or DNS can point it
+	// elsewhere — and http is only ever safe to loopback. Resolve it and require every
+	// address to be loopback, so a poisoned mapping to a real host cannot smuggle the
+	// credential onto the wire in cleartext. If it cannot be resolved at all, allow it:
+	// we cannot prove it hostile, and failing closed would break legitimate offline
+	// local development.
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return true
+	}
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		if ip == nil || !ip.IsLoopback() {
+			return false
+		}
+	}
+	return len(addrs) > 0
 }
 
 func LoadFile() (*File, error) {
@@ -199,7 +215,7 @@ func SaveFile(file *File) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, append(data, '\n'), 0o644)
+	return WriteFileAtomic(path, append(data, '\n'), 0o644)
 }
 
 // UpdateProfile applies mutate to the named profile and persists the result.
@@ -247,9 +263,15 @@ func CredentialsPath() (string, error) {
 	return filepath.Join(dir, credentialsFileName), nil
 }
 
-// writeFileAtomic writes via a temp file in the same directory then renames, so a
+// WriteFileAtomic writes via a temp file in the same directory then renames, so a
 // crash mid-write cannot leave a half-written config or a truncated credential file.
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+//
+// The temp file is fsync'd before the rename and the directory is fsync'd after it, so
+// the durability the credential-refresh path assumes actually holds: once this returns,
+// the new bytes have reached disk, not just the page cache. Without that, a power loss
+// right after a token rotation could leave the superseded refresh token on disk while
+// the server has already invalidated it — stranding the session.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
@@ -258,6 +280,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 
+	// Chmod before writing so the secret is never briefly readable at the default mode.
 	if err := tmp.Chmod(perm); err != nil {
 		tmp.Close()
 		return fmt.Errorf("chmod temp file: %w", err)
@@ -266,10 +289,24 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		tmp.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync temp file: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// fsync the directory so the rename itself survives a crash, not just the bytes.
+	// Best-effort: not every platform or filesystem supports opening a directory for
+	// sync, and a failure here does not mean the data was lost.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 func firstNonEmpty(values ...string) string {

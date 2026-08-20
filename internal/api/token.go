@@ -118,19 +118,42 @@ func (c *Client) canRefresh() bool {
 	return c.apiKey == "" && c.credential != nil && c.credential.RefreshToken != ""
 }
 
+func (c *Client) currentGen() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tokenGen
+}
+
 func (c *Client) refreshIfNeeded(ctx context.Context) error {
 	c.mu.Lock()
 	needs := c.apiKey == "" && c.credential != nil && c.credential.Expired() && c.credential.RefreshToken != ""
+	gen := c.tokenGen
 	c.mu.Unlock()
 	if !needs {
+		return nil
+	}
+	return c.refreshIfCurrent(ctx, gen)
+}
+
+// refreshIfCurrent redeems the refresh token only if no other goroutine has already
+// rotated past the given generation. It serializes on refreshMu, so two racing callers
+// produce exactly one token exchange: the first rotates and bumps the generation, and
+// the second — now observing a newer generation — returns without redeeming the same
+// refresh token again (which reuse detection would read as theft and log everyone out).
+func (c *Client) refreshIfCurrent(ctx context.Context, gen uint64) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	if c.currentGen() != gen {
 		return nil
 	}
 	return c.refresh(ctx)
 }
 
-// refresh rotates the token pair and persists it. Persisting immediately matters:
-// the server has already invalidated the old refresh token, so losing the new one
-// to a crash would strand the session even though the user is still authorized.
+// refresh rotates the token pair and persists it. It must be called with refreshMu
+// held (via refreshIfCurrent) so only one rotation is ever in flight. Persisting
+// immediately matters: the server has already invalidated the old refresh token, so
+// losing the new one to a crash would strand the session even though the user is still
+// authorized.
 func (c *Client) refresh(ctx context.Context) error {
 	c.mu.Lock()
 	if c.credential == nil || c.credential.RefreshToken == "" {
@@ -151,6 +174,7 @@ func (c *Client) refresh(ctx context.Context) error {
 	cred := c.credentialFrom(resp)
 	c.mu.Lock()
 	c.credential = cred
+	c.tokenGen++
 	c.mu.Unlock()
 
 	if c.profile != "" {

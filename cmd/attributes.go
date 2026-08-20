@@ -57,7 +57,7 @@ discovery aid rather than an index: a key missing here can still match older
 traces, so an empty result is not proof of absence.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -99,7 +99,7 @@ recent records. A key showing no values with truncated set means the sample did
 not reach it, not that the key is valueless. Defaults to 24 hours, max 7 days.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}

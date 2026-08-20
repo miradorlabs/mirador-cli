@@ -60,7 +60,7 @@ attribute.customer="acme". Run ` + "`mirador trace tags`" + ` to discover what y
 can filter on before guessing at names.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -121,7 +121,7 @@ func newTraceGetCommand() *cobra.Command {
 		Short: "Show one trace",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -169,7 +169,7 @@ func newTraceEventsCommand() *cobra.Command {
 		Short: "List the events on a trace",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -213,7 +213,7 @@ func newTraceTagsCommand() *cobra.Command {
 		Short: "List the trace tags available to filter on",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}

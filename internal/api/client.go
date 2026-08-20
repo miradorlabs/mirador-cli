@@ -67,6 +67,16 @@ type Client struct {
 	mu         sync.Mutex
 	credential *auth.Credential
 	lastLogin  *LoginResult
+	// tokenGen increments every time credential is replaced. A request records the
+	// generation it authenticated with; the 401 retry then refreshes only if that
+	// generation is still current, so a request that raced a refresh another goroutine
+	// already did retries with the new token instead of redeeming the refresh token a
+	// second time.
+	tokenGen uint64
+	// refreshMu serializes the token exchange so two goroutines never redeem the same
+	// rotated refresh token — which the server's reuse detection would treat as theft
+	// and revoke the whole session.
+	refreshMu sync.Mutex
 
 	projectID string
 }
@@ -87,7 +97,7 @@ func New(cfg *config.Config, opts Options) (*Client, error) {
 	c := &Client{
 		baseURL:   strings.TrimRight(cfg.APIURL, "/"),
 		authURL:   strings.TrimRight(cfg.AuthURL, "/"),
-		http:      &http.Client{Timeout: timeout},
+		http:      newHTTPClient(timeout),
 		version:   opts.Version,
 		profile:   cfg.ProfileName,
 		apiKey:    cfg.APIKey,
@@ -116,9 +126,23 @@ func New(cfg *config.Config, opts Options) (*Client, error) {
 func NewAnonymous(authURL, version string) *Client {
 	return &Client{
 		authURL: strings.TrimRight(authURL, "/"),
-		http:    &http.Client{Timeout: 30 * time.Second},
+		http:    newHTTPClient(30 * time.Second),
 		version: version,
 	}
+}
+
+// newHTTPClient builds the shared transport with redirects refused. An API client that
+// carries bearer and refresh tokens must never follow a redirect: on a 307/308 Go
+// replays the request body — an authorization code, a PKCE verifier, or a refresh
+// token — to the redirect target, and on a same-host https→http downgrade it would put
+// the Authorization header on the wire in cleartext. The gateways never redirect a JSON
+// API call, so a redirect here is a misconfiguration or an attack, not a normal path.
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout, CheckRedirect: refuseRedirects}
+}
+
+func refuseRedirects(req *http.Request, _ []*http.Request) error {
+	return fmt.Errorf("refusing to follow redirect to %s: the Mirador API does not redirect API requests", req.URL.Redacted())
 }
 
 // host selects which surface a call targets. Requests never guess from the path —
@@ -250,6 +274,10 @@ func (c *Client) do(ctx context.Context, h host, method, path string, query url.
 		return nil, err
 	}
 
+	// Record which token generation this attempt authenticated with, so the 401 path
+	// below can tell "my token is genuinely stale" from "another goroutine already
+	// refreshed while my request was in flight".
+	gen := c.currentGen()
 	resp, err := c.attempt(ctx, h, method, path, query, headers, body)
 	if err != nil {
 		return nil, err
@@ -259,7 +287,7 @@ func (c *Client) do(ctx context.Context, h host, method, path string, query url.
 	// elsewhere. One refresh-and-retry covers that; a second 401 is a real logout.
 	if resp.StatusCode == http.StatusUnauthorized && c.canRefresh() {
 		resp.Body.Close()
-		if refreshErr := c.refresh(ctx); refreshErr != nil {
+		if refreshErr := c.refreshIfCurrent(ctx, gen); refreshErr != nil {
 			return nil, refreshErr
 		}
 		resp, err = c.attempt(ctx, h, method, path, query, headers, body)

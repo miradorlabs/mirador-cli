@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -78,7 +80,18 @@ pins one project and skips the browser entirely.`,
 }
 
 func Execute() int {
-	if err := NewRootCommand().Execute(); err != nil {
+	// Ctrl-C (and SIGTERM) cancels the command's context, so an in-flight request is
+	// abandoned promptly instead of blocking until the 30s HTTP timeout. Commands
+	// receive this via cmd.Context().
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := NewRootCommand().ExecuteContext(ctx); err != nil {
+		// An interrupt is not an error worth a message: the user asked to stop. Exit
+		// with the conventional 130 (128 + SIGINT) and stay quiet.
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			return 130
+		}
 		// A missing credential is the one error with an obvious next step, so say it
 		// rather than surfacing a file-not-found.
 		if errors.Is(err, auth.ErrNotLoggedIn) {
@@ -126,8 +139,9 @@ func requireProject(cfg *config.Config) error {
 
 // setupProjectCommand is the preamble every project-scoped read shares: resolve
 // config, insist on a project locally rather than letting the gateway 400, build a
-// client, and settle the output format.
-func setupProjectCommand() (context.Context, *api.Client, output.Format, error) {
+// client, and settle the output format. It returns the command's own context so an
+// interrupt cancels the request rather than being ignored until the HTTP timeout.
+func setupProjectCommand(cmd *cobra.Command) (context.Context, *api.Client, output.Format, error) {
 	cfg, err := loadConfig()
 	if err != nil {
 		return nil, nil, "", err
@@ -143,5 +157,5 @@ func setupProjectCommand() (context.Context, *api.Client, output.Format, error) 
 	if err != nil {
 		return nil, nil, "", err
 	}
-	return context.Background(), client, format, nil
+	return cmd.Context(), client, format, nil
 }

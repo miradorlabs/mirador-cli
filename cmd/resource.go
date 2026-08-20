@@ -62,6 +62,25 @@ func (r resource) itemPath(slug string) string {
 	return r.path + "/" + url.PathEscape(slug)
 }
 
+// collectionItems pulls the list under key out of a gateway list response. It
+// distinguishes a genuinely empty collection — an absent-as-null value or an empty
+// array — from a response whose shape has drifted: a missing key or a non-list value is
+// a contract break worth surfacing, not something to render as "No results." and hide.
+func collectionItems(resp map[string]any, key string) ([]any, error) {
+	raw, present := resp[key]
+	if !present {
+		return nil, fmt.Errorf("unexpected response: no %q field (the API shape may have changed)", key)
+	}
+	if raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("unexpected response: %q is not a list", key)
+	}
+	return items, nil
+}
+
 func (r resource) listCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:     "list",
@@ -69,7 +88,7 @@ func (r resource) listCommand() *cobra.Command {
 		Short:   "List " + r.plural + " in the current project",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -79,7 +98,10 @@ func (r resource) listCommand() *cobra.Command {
 				return err
 			}
 
-			items, _ := resp[r.collection].([]any)
+			items, err := collectionItems(resp, r.collection)
+			if err != nil {
+				return err
+			}
 			rows := make([][]string, 0, len(items))
 			for _, raw := range items {
 				if item, ok := raw.(map[string]any); ok {
@@ -100,7 +122,7 @@ func (r resource) getCommand() *cobra.Command {
 		Short: "Show one " + r.singular + " in full",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -158,7 +180,7 @@ of being silently overwritten. Re-applying an unchanged document is a no-op.`,
 			// additionalProperties:false, so leaving it in is a 400.
 			delete(doc, "slug")
 
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -247,7 +269,7 @@ The delete is conditional: it names the revision it read, so it cannot remove a
 change made after you looked. Pass --etag to assert a specific revision instead.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}

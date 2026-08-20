@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"syscall"
 	"time"
@@ -56,7 +57,7 @@ one hour by design. Ctrl-C to stop.`,
 				return fmt.Errorf("unknown window %q (want one of %s)", window, joinWith(streamWindows, ", "))
 			}
 
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -164,18 +165,16 @@ func formatLogLine(entry logEntry) string {
 	if service == "" {
 		service = "-"
 	}
+	// The body and service come from ingested telemetry, so they are sanitized before
+	// reaching the terminal — this line is printed directly rather than through the
+	// table renderer that would otherwise strip control characters.
 	return fmt.Sprintf("%s  %-5s  %-24s  %s",
 		entry.Time.Local().Format(time.RFC3339),
-		severity,
-		output.Truncate(service, 24),
-		entry.Body)
+		output.SanitizeTerminal(severity),
+		output.SanitizeTerminal(output.Truncate(service, 24)),
+		output.SanitizeTerminal(entry.Body))
 }
 
 func validWindow(window string) bool {
-	for _, w := range streamWindows {
-		if w == window {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(streamWindows, window)
 }

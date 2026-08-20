@@ -76,7 +76,7 @@ serves both. A partial sample still succeeds: check traces_selected.`,
 				return fmt.Errorf("%s has no top-level `program:` to preview", describeSource(file))
 			}
 
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
