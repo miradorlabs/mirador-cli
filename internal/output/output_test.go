@@ -2,6 +2,7 @@ package output
 
 import (
 	"bytes"
+	"encoding/csv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -76,6 +77,25 @@ func TestRenderTable_SanitizesCells(t *testing.T) {
 	}
 	if strings.ContainsRune(buf.String(), esc) {
 		t.Errorf("table output leaked an ESC sequence: %q", buf.String())
+	}
+}
+
+func TestRenderCSV_KeepsFieldsVerbatim(t *testing.T) {
+	// CSV is a data export, not a terminal view: a field with an embedded newline or
+	// tab must survive verbatim (encoding/csv quotes it), not be stripped the way the
+	// human table path sanitizes control characters.
+	var buf bytes.Buffer
+	body := "line1\nline2\twith tab"
+	table := Table{Headers: []string{"NAME", "BODY"}, Rows: [][]string{{"svc", body}}}
+	if err := Render(&buf, FormatCSV, table, nil); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	rows, err := csv.NewReader(strings.NewReader(buf.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("re-parse CSV: %v", err)
+	}
+	if len(rows) != 2 || rows[1][1] != body {
+		t.Errorf("CSV body = %q, want it preserved verbatim (%q)", rows, body)
 	}
 }
 

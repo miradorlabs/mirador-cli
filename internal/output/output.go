@@ -123,16 +123,17 @@ func renderTable(w io.Writer, table Table) error {
 }
 
 func renderCSV(w io.Writer, table Table) error {
+	// CSV is a data format, not a terminal view: encoding/csv already quotes embedded
+	// newlines and commas, so cells pass through verbatim to keep the export faithful.
+	// Terminal-escape sanitizing belongs to the human table path, not here.
 	cw := csv.NewWriter(w)
 	if len(table.Headers) > 0 {
-		if err := cw.Write(sanitizeRow(table.Headers)); err != nil {
+		if err := cw.Write(table.Headers); err != nil {
 			return err
 		}
 	}
-	for _, row := range table.Rows {
-		if err := cw.Write(sanitizeRow(row)); err != nil {
-			return err
-		}
+	if err := cw.WriteAll(table.Rows); err != nil {
+		return err
 	}
 	cw.Flush()
 	return cw.Error()
@@ -170,9 +171,10 @@ func Truncate(s string, max int) string {
 // — data an attacker can influence — and a raw ANSI/OSC escape sequence rendered to a
 // terminal can rewrite the screen, retitle the window, or drive the clipboard. Tabs,
 // newlines, and other C0/C1 controls are dropped; everything printable, including
-// legitimate Unicode, is kept. Machine formats (JSON/YAML) are deliberately left
-// untouched — their encoders already escape control characters — so only the table and
-// CSV renderers and callers printing directly to a terminal route through here.
+// legitimate Unicode, is kept. Machine formats (JSON/YAML/CSV) are deliberately left
+// untouched — their encoders escape or quote control characters and their output is
+// meant to be parsed, not read off a terminal — so only the table renderer and callers
+// printing directly to a terminal route through here.
 func SanitizeTerminal(s string) string {
 	if !strings.ContainsFunc(s, isControlRune) {
 		return s

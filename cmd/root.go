@@ -80,17 +80,43 @@ pins one project and skips the browser entirely.`,
 }
 
 func Execute() int {
-	// Ctrl-C (and SIGTERM) cancels the command's context, so an in-flight request is
-	// abandoned promptly instead of blocking until the 30s HTTP timeout. Commands
-	// receive this via cmd.Context().
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// The first SIGINT/SIGTERM cancels the running command's context so an in-flight
+	// request unwinds promptly instead of waiting out the 30s HTTP timeout. Default
+	// signal handling is then restored, so a *second* signal — or a signal that arrives
+	// while a command is blocked on a stdin read that never watches the context (the
+	// interactive project picker, `apply -f -`) — still force-terminates the process
+	// rather than being swallowed.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	caught := make(chan os.Signal, 1)
+	go func() {
+		select {
+		case s := <-sigCh:
+			caught <- s
+			cancel()
+			signal.Stop(sigCh) // restore default handling; the next signal terminates
+		case <-ctx.Done():
+			// The command finished on its own; stop waiting so this goroutine exits.
+		}
+	}()
 
 	if err := NewRootCommand().ExecuteContext(ctx); err != nil {
 		// An interrupt is not an error worth a message: the user asked to stop. Exit
-		// with the conventional 130 (128 + SIGINT) and stay quiet.
-		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-			return 130
+		// quietly with the conventional 128 + signal-number status.
+		if errors.Is(err, context.Canceled) {
+			select {
+			case s := <-caught:
+				if s == syscall.SIGTERM {
+					return 143 // 128 + SIGTERM(15)
+				}
+				return 130 // 128 + SIGINT(2)
+			default:
+			}
 		}
 		// A missing credential is the one error with an obvious next step, so say it
 		// rather than surfacing a file-not-found.
