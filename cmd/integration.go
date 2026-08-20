@@ -43,7 +43,7 @@ func newIntegrationListCommand() *cobra.Command {
 		Short:   "List the organization's notification channels",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -76,7 +76,7 @@ func newIntegrationGetCommand() *cobra.Command {
 		Short: "Show one notification channel",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}

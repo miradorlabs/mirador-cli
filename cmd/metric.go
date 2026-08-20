@@ -66,7 +66,7 @@ you the idiom — a gauge reads directly, a sum wants rate(), a histogram wants
 histogram_quantile().`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -121,7 +121,7 @@ func newMetricQueryCommand() *cobra.Command {
 		Short: "Evaluate a PromQL expression at one instant",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -150,7 +150,7 @@ func newMetricRangeCommand() *cobra.Command {
 		Short: "Evaluate a PromQL expression over a time range",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}

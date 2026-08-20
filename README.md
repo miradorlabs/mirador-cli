@@ -171,8 +171,10 @@ The selection is stored in the active profile. Every project-scoped request send
 
 ## Commands
 
-The CLI covers the API gateway's full surface — every operation in its OpenAPI
-document has a command, enforced by a test.
+The CLI covers the API gateway's full surface: every operation in its OpenAPI
+document maps to a command. A test (`cmd/parity_test.go`) asserts that each mapped
+command exists and is runnable — it guards against a command being dropped or
+renamed, not against a command calling the wrong endpoint.
 
 | Command | What it does |
 |---|---|
@@ -186,7 +188,7 @@ document has a command, enforced by a test.
 | `mirador metric-alert list \| get \| apply \| delete` | Manage metric alerts |
 | `mirador derived-metric list \| get \| apply \| delete \| dry-run` | Author derived metrics |
 | `mirador integration list \| get` | Notification channels alerts can name |
-| `mirador config show \| profiles \| use \| set \| envs` | Manage profiles and environments |
+| `mirador config show \| profiles \| use \| set` | Manage configuration profiles |
 
 ## Managing resources as files
 

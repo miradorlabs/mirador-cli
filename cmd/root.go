@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -78,7 +80,44 @@ pins one project and skips the browser entirely.`,
 }
 
 func Execute() int {
-	if err := NewRootCommand().Execute(); err != nil {
+	// The first SIGINT/SIGTERM cancels the running command's context so an in-flight
+	// request unwinds promptly instead of waiting out the 30s HTTP timeout. Default
+	// signal handling is then restored, so a *second* signal — or a signal that arrives
+	// while a command is blocked on a stdin read that never watches the context (the
+	// interactive project picker, `apply -f -`) — still force-terminates the process
+	// rather than being swallowed.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	caught := make(chan os.Signal, 1)
+	go func() {
+		select {
+		case s := <-sigCh:
+			caught <- s
+			cancel()
+			signal.Stop(sigCh) // restore default handling; the next signal terminates
+		case <-ctx.Done():
+			// The command finished on its own; stop waiting so this goroutine exits.
+		}
+	}()
+
+	if err := NewRootCommand().ExecuteContext(ctx); err != nil {
+		// An interrupt is not an error worth a message: the user asked to stop. Exit
+		// quietly with the conventional 128 + signal-number status.
+		if errors.Is(err, context.Canceled) {
+			select {
+			case s := <-caught:
+				if s == syscall.SIGTERM {
+					return 143 // 128 + SIGTERM(15)
+				}
+				return 130 // 128 + SIGINT(2)
+			default:
+			}
+		}
 		// A missing credential is the one error with an obvious next step, so say it
 		// rather than surfacing a file-not-found.
 		if errors.Is(err, auth.ErrNotLoggedIn) {
@@ -126,8 +165,9 @@ func requireProject(cfg *config.Config) error {
 
 // setupProjectCommand is the preamble every project-scoped read shares: resolve
 // config, insist on a project locally rather than letting the gateway 400, build a
-// client, and settle the output format.
-func setupProjectCommand() (context.Context, *api.Client, output.Format, error) {
+// client, and settle the output format. It returns the command's own context so an
+// interrupt cancels the request rather than being ignored until the HTTP timeout.
+func setupProjectCommand(cmd *cobra.Command) (context.Context, *api.Client, output.Format, error) {
 	cfg, err := loadConfig()
 	if err != nil {
 		return nil, nil, "", err
@@ -143,5 +183,5 @@ func setupProjectCommand() (context.Context, *api.Client, output.Format, error) 
 	if err != nil {
 		return nil, nil, "", err
 	}
-	return context.Background(), client, format, nil
+	return cmd.Context(), client, format, nil
 }

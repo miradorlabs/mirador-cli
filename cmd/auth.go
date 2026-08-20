@@ -58,14 +58,7 @@ projects afterwards without logging in again.`,
 				orgName = result.OrganizationName
 			}
 			if err := config.UpdateProfile(cfg.ProfileName, func(p *config.Profile) {
-				p.OrganizationID = cred.OrganizationID
-				p.OrganizationName = orgName
-				// A credential for a different organization makes the remembered project
-				// meaningless, and leaving it would produce a confusing 403 on the next read.
-				if p.OrganizationID != cred.OrganizationID {
-					p.ProjectID = ""
-					p.ProjectName = ""
-				}
+				applyLogin(p, cred, orgName)
 			}); err != nil {
 				return err
 			}
@@ -179,6 +172,20 @@ func newWhoamiCommand() *cobra.Command {
 			return output.KeyValues(cmd.OutOrStdout(), format, pairs, identity)
 		},
 	}
+}
+
+// applyLogin folds a freshly minted credential into a profile. When the credential is
+// for a different organization than the profile last recorded, the remembered project
+// is cleared: it belonged to the old organization and would only earn a confusing 403
+// on the next read. The old organization must be compared *before* it is overwritten —
+// comparing after the assignment would always match and never clear the stale project.
+func applyLogin(p *config.Profile, cred *auth.Credential, orgName string) {
+	if p.OrganizationID != cred.OrganizationID {
+		p.ProjectID = ""
+		p.ProjectName = ""
+	}
+	p.OrganizationID = cred.OrganizationID
+	p.OrganizationName = orgName
 }
 
 // displayOrg prefers the human name and keeps the id alongside it, since the id is

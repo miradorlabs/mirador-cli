@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
@@ -113,15 +114,18 @@ func renderTable(w io.Writer, table Table) error {
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
 	if len(table.Headers) > 0 {
-		fmt.Fprintln(tw, strings.Join(table.Headers, "\t"))
+		fmt.Fprintln(tw, strings.Join(sanitizeRow(table.Headers), "\t"))
 	}
 	for _, row := range table.Rows {
-		fmt.Fprintln(tw, strings.Join(row, "\t"))
+		fmt.Fprintln(tw, strings.Join(sanitizeRow(row), "\t"))
 	}
 	return tw.Flush()
 }
 
 func renderCSV(w io.Writer, table Table) error {
+	// CSV is a data format, not a terminal view: encoding/csv already quotes embedded
+	// newlines and commas, so cells pass through verbatim to keep the export faithful.
+	// Terminal-escape sanitizing belongs to the human table path, not here.
 	cw := csv.NewWriter(w)
 	if len(table.Headers) > 0 {
 		if err := cw.Write(table.Headers); err != nil {
@@ -147,16 +151,50 @@ func KeyValues(w io.Writer, format Format, pairs [][2]string, data any) error {
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, p := range pairs {
-		fmt.Fprintf(tw, "%s:\t%s\n", p[0], p[1])
+		fmt.Fprintf(tw, "%s:\t%s\n", SanitizeTerminal(p[0]), SanitizeTerminal(p[1]))
 	}
 	return tw.Flush()
 }
 
 // Truncate keeps a table column from wrapping and destroying the alignment that
-// makes it readable in the first place.
+// makes it readable in the first place. It counts and slices by rune, so a limit that
+// falls inside a multi-byte character (CJK, emoji) never leaves a mangled half-rune.
 func Truncate(s string, max int) string {
-	if max <= 1 || len(s) <= max {
+	if max <= 1 || utf8.RuneCountInString(s) <= max {
 		return s
 	}
-	return s[:max-1] + "…"
+	return string([]rune(s)[:max-1]) + "…"
+}
+
+// SanitizeTerminal strips control characters from a value bound for a human-facing
+// terminal. Log bodies, trace names, and attribute values come from ingested telemetry
+// — data an attacker can influence — and a raw ANSI/OSC escape sequence rendered to a
+// terminal can rewrite the screen, retitle the window, or drive the clipboard. Tabs,
+// newlines, and other C0/C1 controls are dropped; everything printable, including
+// legitimate Unicode, is kept. Machine formats (JSON/YAML/CSV) are deliberately left
+// untouched — their encoders escape or quote control characters and their output is
+// meant to be parsed, not read off a terminal — so only the table renderer and callers
+// printing directly to a terminal route through here.
+func SanitizeTerminal(s string) string {
+	if !strings.ContainsFunc(s, isControlRune) {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if isControlRune(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+}
+
+func sanitizeRow(cells []string) []string {
+	out := make([]string, len(cells))
+	for i, c := range cells {
+		out[i] = SanitizeTerminal(c)
+	}
+	return out
 }

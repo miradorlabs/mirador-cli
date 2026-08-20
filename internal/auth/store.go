@@ -80,23 +80,42 @@ func LoadCredential(profile string) (*Credential, error) {
 }
 
 func SaveCredential(profile string, cred *Credential) error {
-	file, err := loadCredentialFile()
-	if err != nil {
-		return err
-	}
-	file[profile] = cred
-	return saveCredentialFile(file)
+	return mutateCredentialFile(func(file credentialFile) {
+		file[profile] = cred
+	})
 }
 
 func DeleteCredential(profile string) error {
+	return mutateCredentialFile(func(file credentialFile) {
+		delete(file, profile)
+	})
+}
+
+// mutateCredentialFile runs mutate against the on-disk credential map under an
+// exclusive cross-process lock, then persists the result. Locking the whole
+// read-modify-write is what stops two concurrent `mirador` processes from clobbering
+// each other: without it, each reads the map, changes its own profile, and writes the
+// whole thing back — and the second writer erases the first's unrelated entry.
+func mutateCredentialFile(mutate func(credentialFile)) error {
+	path, err := config.CredentialsPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+
+	unlock, err := lockCredentialFile(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	file, err := loadCredentialFile()
 	if err != nil {
 		return err
 	}
-	if _, ok := file[profile]; !ok {
-		return nil
-	}
-	delete(file, profile)
+	mutate(file)
 	return saveCredentialFile(file)
 }
 
@@ -135,29 +154,5 @@ func saveCredentialFile(file credentialFile) error {
 		return err
 	}
 	// 0600: this file holds live access and refresh tokens.
-	return writeFileAtomic(path, append(data, '\n'), 0o600)
-}
-
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-
-	// Chmod before writing so the secret is never briefly readable at the default mode.
-	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-	return os.Rename(tmpName, path)
+	return config.WriteFileAtomic(path, append(data, '\n'), 0o600)
 }

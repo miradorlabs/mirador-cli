@@ -75,6 +75,46 @@ func TestReadDocument_ReadsStdin(t *testing.T) {
 	}
 }
 
+// TestCollectionItems separates an empty collection from a drifted response shape. A
+// renamed key or a changed value type should surface as an error, not masquerade as an
+// empty list — the latter reads as "you have no dashboards" when the truth is "the CLI
+// no longer understands this response".
+func TestCollectionItems(t *testing.T) {
+	tests := []struct {
+		name    string
+		resp    map[string]any
+		wantLen int
+		wantErr string
+	}{
+		{name: "populated", resp: map[string]any{"dashboards": []any{map[string]any{}, map[string]any{}}}, wantLen: 2},
+		{name: "empty array", resp: map[string]any{"dashboards": []any{}}, wantLen: 0},
+		{name: "json null is empty", resp: map[string]any{"dashboards": nil}, wantLen: 0},
+		{name: "missing key is a contract break", resp: map[string]any{"widgets": []any{}}, wantErr: "no \"dashboards\" field"},
+		{name: "wrong type is a contract break", resp: map[string]any{"dashboards": "nope"}, wantErr: "not a list"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			items, err := collectionItems(tc.resp, "dashboards")
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected an error mentioning %q", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("error %q does not mention %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("collectionItems: %v", err)
+			}
+			if len(items) != tc.wantLen {
+				t.Errorf("len = %d, want %d", len(items), tc.wantLen)
+			}
+		})
+	}
+}
+
 // TestResolveSlug covers the three ways a slug can arrive and the one way they can
 // conflict. The file-provided slug is what makes a directory of documents
 // self-describing and re-appliable without per-file arguments.

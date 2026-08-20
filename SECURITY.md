@@ -16,11 +16,14 @@ argued with — if a claim here is wrong, that is a bug.
 A CLI credential is **org-scoped**: it reaches every project in one organization and no
 other organization. It cannot mint API keys or other credentials.
 
-It is **not read-only**. The data API carries a few conditional writes — dashboards, and
-(since the metric-alerts surface landed) `PUT`/`DELETE /v1/metric-alerts/{slug}` — and a CLI
-token can reach them. Those writes are attributed to the real user id rather than a key id,
-so the audit trail names a person; but a leaked token can modify alerting, not just read it.
-The CLI deliberately exposes no command for them, which limits accident, not intent.
+It is **not read-only**. The data API carries conditional writes — dashboards, metric alerts,
+and derived metrics — and a CLI token can reach them. The CLI exposes them directly:
+`dashboard`, `metric-alert`, and `derived-metric` each have `apply` and `delete`
+subcommands. Those writes are attributed to the real user id rather than a key id, so the
+audit trail names a person; but a leaked token can create, replace, or delete these documents,
+not just read them. The writes are conditional (`If-Match`/`If-None-Match`), so a leaked token
+cannot blindly clobber a revision it has not seen — but that is a concurrency guard, not an
+authorization one.
 
 ## The login flow, and what each control is for
 

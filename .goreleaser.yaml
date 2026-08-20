@@ -4,7 +4,10 @@ project_name: mirador
 
 before:
   hooks:
-    - go mod tidy
+    # verify, not tidy: a tagged release must build from the committed go.mod/go.sum,
+    # never silently re-resolve dependencies at release time. `go mod verify` checks the
+    # module cache matches go.sum; it does not mutate anything.
+    - go mod verify
     - go test ./...
 
 builds:
@@ -15,6 +18,11 @@ builds:
     binary: mirador
     env:
       - CGO_ENABLED=0
+    # -mod=readonly fails the build if the module graph disagrees with go.sum instead of
+    # rewriting it; -trimpath drops local filesystem paths for a reproducible binary.
+    flags:
+      - -mod=readonly
+      - -trimpath
     goos: [darwin, linux, windows]
     goarch: [amd64, arm64]
     # -s -w drops the symbol table and DWARF; the version is the git tag so

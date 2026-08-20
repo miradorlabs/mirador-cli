@@ -24,9 +24,9 @@ jobs:
           cache: true
 
       # A release that ships a vulnerable stdlib is worse than a late release, and this
-      # binary handles credentials.
+      # binary handles credentials. Pinned so the scanner is a reproducible input.
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
       - uses: goreleaser/goreleaser-action@v6
         with:

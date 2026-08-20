@@ -40,22 +40,29 @@ func (c *Client) Stream(ctx context.Context, path string, query url.Values, last
 		return nil, err
 	}
 
-	headers := http.Header{}
-	if lastEventID != "" {
-		headers.Set("Last-Event-ID", lastEventID)
-	}
+	// A zero Timeout is the point: http.Client's timeout spans reading the body, so
+	// the shared 30-second client would sever a healthy tail. ctx governs instead.
+	// Redirects are refused here for the same reason as the unary client.
+	client := &http.Client{Transport: c.http.Transport, CheckRedirect: refuseRedirects}
 
-	req, err := c.newRequest(ctx, dataHost, http.MethodGet, path, query, headers, nil)
+	gen := c.currentGen()
+	resp, err := c.openStream(ctx, client, path, query, lastEventID)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "text/event-stream")
 
-	// A zero Timeout is the point: http.Client's timeout spans reading the body, so
-	// the shared 30-second client would sever a healthy tail. ctx governs instead.
-	resp, err := (&http.Client{Transport: c.http.Transport}).Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("stream %s: %w", path, err)
+	// A 401 on a token we believed was live means it was revoked or rotated elsewhere;
+	// one refresh-and-retry recovers a tail whose token expired mid-stream, exactly as
+	// the unary path in do() does.
+	if resp.StatusCode == http.StatusUnauthorized && c.canRefresh() {
+		resp.Body.Close()
+		if refreshErr := c.refreshIfCurrent(ctx, gen); refreshErr != nil {
+			return nil, refreshErr
+		}
+		resp, err = c.openStream(ctx, client, path, query, lastEventID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
@@ -65,6 +72,24 @@ func (c *Client) Stream(ctx context.Context, path string, query url.Values, last
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64<<10), maxFrameBytes)
 	return &Stream{resp: resp, scanner: scanner}, nil
+}
+
+func (c *Client) openStream(ctx context.Context, client *http.Client, path string, query url.Values, lastEventID string) (*http.Response, error) {
+	headers := http.Header{}
+	if lastEventID != "" {
+		headers.Set("Last-Event-ID", lastEventID)
+	}
+	req, err := c.newRequest(ctx, dataHost, http.MethodGet, path, query, headers, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("stream %s: %w", path, err)
+	}
+	return resp, nil
 }
 
 // Next returns the next frame, blocking until one arrives. It returns io.EOF when

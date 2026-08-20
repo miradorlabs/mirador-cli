@@ -53,7 +53,7 @@ The window may span at most 35 days, and the response echoes the window it
 actually read — worth checking before concluding a service is quiet.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -129,7 +129,7 @@ func newLogStatsCommand() *cobra.Command {
 		Short: "Summarize log volume over a window",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx, client, format, err := setupProjectCommand()
+			ctx, client, format, err := setupProjectCommand(cmd)
 			if err != nil {
 				return err
 			}
