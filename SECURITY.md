@@ -89,5 +89,6 @@ Properties worth re-checking after any change to `internal/auth` or `internal/ap
 - Hostile callbacks neither authenticate nor cancel (`TestLogin_HostileCallbacksAloneNeverAuthenticate`,
   `TestLogin_WrongStateDoesNotCancelThePendingLogin`).
 
-`go run golang.org/x/vuln/cmd/govulncheck@latest ./...` runs in CI on every push and weekly —
-weekly because a dependency can become vulnerable without us touching a line.
+`go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...` runs in CI on every push and weekly —
+pinned so the scanner itself is a reproducible input, weekly because a dependency can become
+vulnerable without us touching a line.

@@ -1,7 +1,25 @@
+```text
+███╗   ███╗██╗██████╗  █████╗ ██████╗  ██████╗ ██████╗      ██████╗██╗     ██╗
+████╗ ████║██║██╔══██╗██╔══██╗██╔══██╗██╔═══██╗██╔══██╗    ██╔════╝██║     ██║
+██╔████╔██║██║██████╔╝███████║██║  ██║██║   ██║██████╔╝    ██║     ██║     ██║
+██║╚██╔╝██║██║██╔══██╗██╔══██║██║  ██║██║   ██║██╔══██╗    ██║     ██║     ██║
+██║ ╚═╝ ██║██║██║  ██║██║  ██║██████╔╝╚██████╔╝██║  ██║    ╚██████╗███████╗██║
+╚═╝     ╚═╝╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝ ╚═╝  ╚═╝     ╚═════╝╚══════╝╚═╝
+```
+
 # mirador-cli
+
+[![CI](https://github.com/miradorlabs/mirador-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/miradorlabs/mirador-cli/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/miradorlabs/mirador-cli)](https://github.com/miradorlabs/mirador-cli/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 The command-line client for the [Mirador](https://mirador.org) API — traces, OpenTelemetry
 logs, PromQL metrics, and dashboards, from your terminal.
+
+## Quick start
+
+You need a Mirador account — sign up at [mirador.org](https://mirador.org). Then
+[install the CLI](#install) and:
 
 ```console
 $ mirador login
@@ -20,7 +38,13 @@ $ mirador project use checkout
 Now using project checkout (3f2b…).
 
 $ mirador trace list --filter 'status="running"' --since 1h
+  TRACE ID    NAME                       STATUS     DURATION   CREATED
+  9c41…       checkout.settlement        running    12.4s      2026-08-25T09:14:03+02:00
+  b7e2…       checkout.bridge-transfer   running    3.1s       2026-08-25T09:15:47+02:00
 ```
+
+The filter language and time flags are covered in
+[Filters and time windows](#filters-and-time-windows).
 
 ## Install
 
@@ -46,16 +70,22 @@ Every release publishes static binaries for macOS, Linux and Windows on
 alongside them:
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.1.0            # check Releases for the latest tag
 OS=$(uname -s)            # Darwin | Linux
 ARCH=$(uname -m)          # arm64 | x86_64
-curl -sSL -o mirador.tar.gz \
+curl -sSL -O \
   "https://github.com/miradorlabs/mirador-cli/releases/download/${VERSION}/mirador_${OS}_${ARCH}.tar.gz"
-tar -xzf mirador.tar.gz mirador
+curl -sSL -O \
+  "https://github.com/miradorlabs/mirador-cli/releases/download/${VERSION}/checksums.txt"
+shasum -a 256 --check --ignore-missing checksums.txt
+tar -xzf "mirador_${OS}_${ARCH}.tar.gz" mirador
 sudo mv mirador /usr/local/bin/
 ```
 
 CGO is off, so the binary is static — no matching libc required.
+
+On Windows, download `mirador_Windows_x86_64.zip` (or `arm64`) from Releases, check it
+against `checksums.txt`, and put `mirador.exe` somewhere on your `PATH`.
 
 ### From source
 
@@ -72,45 +102,18 @@ name it `mirador-cli` after the module path.
 Homebrew wires these up automatically. Otherwise:
 
 ```bash
-mirador completion zsh  > "${fpath[1]}/_mirador"          # zsh
-mirador completion bash > /etc/bash_completion.d/mirador  # bash
+# zsh — any directory on your fpath; add this one in ~/.zshrc before compinit:
+#   fpath=(~/.zsh/completions $fpath)
+mkdir -p ~/.zsh/completions
+mirador completion zsh > ~/.zsh/completions/_mirador
+
+# bash — the user-level completions directory, no root needed
+mkdir -p ~/.local/share/bash-completion/completions
+mirador completion bash > ~/.local/share/bash-completion/completions/mirador
+
+# fish
 mirador completion fish > ~/.config/fish/completions/mirador.fish
 ```
-
-## Endpoints
-
-The CLI talks to three Mirador hosts, and knows which is which:
-
-| Host | Used for |
-|---|---|
-| `auth.mirador.org` | `login`, `logout`, token refresh, `project list`, `org list` |
-| `api.mirador.org` | `trace`, `log`, `metric`, `dashboard`, `metric-alert`, `derived-metric` |
-| `app.mirador.org` | the browser page `login` opens |
-
-Credentials are minted on their own host so an auth outage cannot take reads down with it — the
-data API validates tokens directly against Redis and never calls the auth host per request.
-
-**Nothing needs configuring.** These are the defaults, and for Mirador's hosted service they are
-the only endpoints you need.
-
-Running a self-hosted deployment? Point the CLI at it with environment variables:
-
-```bash
-export MIRADOR_API_URL=https://api.example.com
-export MIRADOR_AUTH_URL=https://auth.example.com
-export MIRADOR_APP_URL=https://app.example.com
-```
-
-Or store them on a profile so they persist and you can switch between deployments:
-
-```bash
-mirador config use staging
-mirador config set --api-url https://api.example.com --auth-url https://auth.example.com
-mirador --profile staging whoami
-```
-
-Each host is set independently, and a credential is bound to the auth host that minted it — point
-the CLI somewhere else and it refuses the old credential rather than sending it to the new host.
 
 ## Authentication
 
@@ -190,6 +193,30 @@ renamed, not against a command calling the wrong endpoint.
 | `mirador integration list \| get` | Notification channels alerts can name |
 | `mirador config show \| profiles \| use \| set` | Manage configuration profiles |
 
+## Filters and time windows
+
+`--filter` (shorthand `-f` on the query commands) takes an
+[AIP-160](https://google.aip.dev/160) filter expression — quoted values, `=` for
+equality, `AND` to combine clauses:
+
+```bash
+mirador trace list --filter 'status="running"'
+mirador log query  --filter 'severity="error" AND service.name="checkout"'
+```
+
+The filterable keys are not a fixed list — they are whatever your telemetry carries.
+Discover them before writing a filter:
+
+```bash
+mirador trace attributes   # keys seen on traces, and the values seen for them
+mirador log attributes     # keys seen on logs
+```
+
+`--since` and `--until` bound the query window, and each takes an RFC 3339 timestamp
+(`2026-08-25T09:00:00Z`) or a relative age like `2h`. `log tail --window` replays a
+fixed window on connect and accepts one of `1m`, `5m`, `15m`, `1h`, `4h`, `12h`,
+`24h`, `7d`, `30d`.
+
 ## Managing resources as files
 
 Dashboards, metric alerts and derived metrics share one contract: a slug is the
@@ -203,8 +230,10 @@ mirador derived-metric dry-run -f metrics/slippage.yaml  # preview before commit
 mirador derived-metric apply -f metrics/slippage.yaml
 ```
 
+Here `-f` is `--file` (on the query commands the same shorthand means `--filter`).
 The file is YAML or JSON, and carries the resource's own fields. A top-level `slug:`
-names it, so files are self-describing:
+names it, so files are self-describing; an explicit slug — the argument, or `--slug` —
+overrides the file's, and passing an argument and `--slug` that disagree is an error:
 
 ```yaml
 slug: payments
@@ -244,6 +273,41 @@ almost always wants to parse the result. `-o` always wins.
 The table view is a summary; `-o json` returns the complete object, including fields no
 column shows. When a result is truncated or paged, the CLI says so on stderr rather than
 letting a partial answer look complete.
+
+## Endpoints
+
+The CLI talks to three Mirador hosts, and knows which is which:
+
+| Host | Used for |
+|---|---|
+| `auth.mirador.org` | `login`, `logout`, token refresh, `project list`, `org list` |
+| `api.mirador.org` | `trace`, `log`, `metric`, `dashboard`, `metric-alert`, `derived-metric` |
+| `app.mirador.org` | the browser page `login` opens |
+
+Credentials are minted on their own host so an auth outage cannot take reads down with it — the
+data API validates tokens directly against Redis and never calls the auth host per request.
+
+**Nothing needs configuring.** These are the defaults, and for Mirador's hosted service they are
+the only endpoints you need.
+
+Running a self-hosted deployment? Point the CLI at it with environment variables:
+
+```bash
+export MIRADOR_API_URL=https://api.example.com
+export MIRADOR_AUTH_URL=https://auth.example.com
+export MIRADOR_APP_URL=https://app.example.com
+```
+
+Or store them on a profile so they persist and you can switch between deployments:
+
+```bash
+mirador config use staging
+mirador config set --api-url https://api.example.com --auth-url https://auth.example.com
+mirador --profile staging whoami
+```
+
+Each host is set independently, and a credential is bound to the auth host that minted it — point
+the CLI somewhere else and it refuses the old credential rather than sending it to the new host.
 
 ## Configuration
 
@@ -331,10 +395,10 @@ Two things must exist before the first release:
    there. Without it the release still publishes and only the tap update fails, so a
    missing token costs you a re-run, not a broken release.
 
-While this repo is private, `brew install` needs the tap public *and* the release assets
-reachable — Homebrew downloads them unauthenticated. Public tap plus private releases will
-fail at download. Until the repo is public, `make install` and direct downloads by
-authenticated users are the working paths.
+Homebrew downloads the cask and the release archives unauthenticated, so `brew install`
+works only while the tap *and* this repo's releases are both public. If either is private —
+a fork, an internal build — `make install` and direct downloads by authenticated users are
+the working paths.
 
 ## Contract
 
