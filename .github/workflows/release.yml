@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write # create the GitHub Release and upload archives
+  id-token: write # OIDC identity for signing the provenance attestation
+  attestations: write # store the attestation with GitHub
 
 jobs:
   goreleaser:
@@ -38,3 +40,14 @@ jobs:
           # GITHUB_TOKEN is scoped to this repo only and cannot push the cask.
           # Without it the release still publishes; only the tap update fails.
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      # Signed build provenance for every published artifact, verifiable with
+      # `gh attestation verify <file> --owner miradorlabs`. Runs after GoReleaser so
+      # it attests exactly the bytes that were uploaded to the Release.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt

@@ -1,0 +1,44 @@
+name: Attest existing release
+
+# Backfills provenance attestations for a release that was published before the
+# release workflow attested its artifacts (v1.0.0). Downloads the release's assets
+# and attests those exact bytes.
+#
+# Honest scope: an attestation created here names THIS workflow as the builder, not
+# the run that originally compiled the release — it proves "miradorlabs' CI signed
+# these exact bytes", which is the org-vouches-for-it guarantee, not a record of the
+# original build. From the next tag onward release.yml attests at build time and
+# this workflow should not be needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attest (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: read # download the release assets
+  id-token: write # OIDC identity for signing the attestation
+  attestations: write # store the attestation with GitHub
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
+          ls -l assets
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            assets/*.tar.gz
+            assets/*.zip
+            assets/checksums.txt
