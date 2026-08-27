@@ -151,16 +151,22 @@ func newTraceGetCommand() *cobra.Command {
 }
 
 type traceEvent struct {
-	EventID   string    `json:"event_id,omitempty"`
-	Type      string    `json:"type,omitempty"`
-	Name      string    `json:"name,omitempty"`
-	Severity  string    `json:"severity,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
+	EventType      string         `json:"event_type"`
+	Severity       string         `json:"severity,omitempty"`
+	Version        uint64         `json:"version"`
+	Source         string         `json:"source"`
+	CreatedAt      time.Time      `json:"created_at"`
+	TraceTimestamp *time.Time     `json:"trace_timestamp,omitempty"`
+	SpanID         string         `json:"span_id,omitempty"`
+	ParentSpanID   string         `json:"parent_span_id,omitempty"`
+	Selector       string         `json:"selector,omitempty"`
+	Attributes     map[string]any `json:"attributes,omitempty"`
+	Payload        map[string]any `json:"payload"`
 }
 
 type traceEventsResponse struct {
-	Events    []traceEvent `json:"events"`
-	ProjectID string       `json:"project_id"`
+	TraceID string       `json:"trace_id"`
+	Events  []traceEvent `json:"events"`
 }
 
 func newTraceEventsCommand() *cobra.Command {
@@ -183,14 +189,14 @@ func newTraceEventsCommand() *cobra.Command {
 			rows := make([][]string, 0, len(resp.Events))
 			for _, e := range resp.Events {
 				rows = append(rows, []string{
-					e.Timestamp.Local().Format(time.RFC3339),
-					e.Type,
-					output.Truncate(e.Name, 48),
+					e.CreatedAt.Local().Format(time.RFC3339),
+					e.EventType,
+					output.Truncate(e.Selector, 48),
 					e.Severity,
 				})
 			}
 			return output.Render(cmd.OutOrStdout(), format, output.Table{
-				Headers: []string{"TIME", "TYPE", "NAME", "SEVERITY"},
+				Headers: []string{"TIME", "TYPE", "SELECTOR", "SEVERITY"},
 				Rows:    rows,
 			}, resp)
 		},
