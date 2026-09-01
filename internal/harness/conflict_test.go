@@ -383,6 +383,7 @@ func TestConnectWritesThroughASymlink(t *testing.T) {
 	dir := t.TempDir()
 	realDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", filepath.Join(dir, "mirador"))
 
 	target := filepath.Join(realDir, "settings.json")
 	if err := os.WriteFile(target, []byte(`{"model":"opus"}`), 0o600); err != nil {
@@ -571,6 +572,133 @@ func TestDisconnectRestoresClearedConflicts(t *testing.T) {
 	if got := readJSON(t, path)["otelHeadersHelper"]; got != "/usr/local/bin/headers.sh" {
 		t.Errorf("otelHeadersHelper = %v, want it restored", got)
 	}
+	if _, ok := envOf(t, path)[claudeOtelHeadersHelper]; ok {
+		t.Error("otelHeadersHelper was also restored inside env")
+	}
+}
+
+// A reconnect updates what Mirador installed, but it must not turn the preceding
+// Mirador installation into the value disconnect restores. The ownership chain starts
+// before the first connect and survives until the final disconnect.
+func TestReconnectPreservesOriginalJournal(t *testing.T) {
+	c, path := claudeIn(t, `{
+		"otelHeadersHelper":"/usr/local/bin/headers.sh",
+		"env":{"OTEL_EXPORTER_OTLP_ENDPOINT":"https://original.example.com"}
+	}`)
+
+	first := fullExporter()
+	first.APIKey = "mir_srv_first_credential"
+	if err := c.Connect(c.Render(first), true); err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+
+	second := fullExporter()
+	second.APIKey = "mir_srv_second_credential"
+	if err := c.Connect(c.Render(second), true); err != nil {
+		t.Fatalf("second Connect: %v", err)
+	}
+
+	if _, err := c.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	env := envOf(t, path)
+	if got := env[otelEndpoint]; got != "https://original.example.com" {
+		t.Errorf("endpoint = %q, want the value from before the first connect", got)
+	}
+	if _, ok := env[otelHeaders]; ok {
+		t.Error("a Mirador credential survived the final disconnect")
+	}
+	if got := readJSON(t, path)[claudeOtelHeadersHelper]; got != "/usr/local/bin/headers.sh" {
+		t.Errorf("otelHeadersHelper = %v, want the conflict cleared by the first connect restored", got)
+	}
+}
+
+// A first disconnect deliberately leaves an edited value alone. Keeping a reduced
+// journal makes that decision stable: status no longer calls the edit Mirador-owned,
+// and a repeated disconnect cannot fall into the legacy name-based removal path.
+func TestRepeatedDisconnectKeepsEditedKeys(t *testing.T) {
+	c, path := claudeIn(t, `{}`)
+	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	s, err := loadSettings(path)
+	if err != nil {
+		t.Fatalf("loadSettings: %v", err)
+	}
+	s.env[claudeEnableTelemetry] = "0"
+	if err := s.save(false); err != nil {
+		t.Fatalf("save edit: %v", err)
+	}
+
+	first, err := c.Disconnect()
+	if err != nil {
+		t.Fatalf("first Disconnect: %v", err)
+	}
+	if !slices.Contains(first.Skipped, claudeEnableTelemetry) {
+		t.Fatalf("first skipped = %v, want the edited switch", first.Skipped)
+	}
+	status, err := c.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.ManagedKeys != 0 {
+		t.Fatalf("ManagedKeys = %d, want the edited value excluded from Mirador ownership", status.ManagedKeys)
+	}
+
+	second, err := c.Disconnect()
+	if err != nil {
+		t.Fatalf("second Disconnect: %v", err)
+	}
+	if second.Removed != 0 || second.Restored != 0 {
+		t.Fatalf("second Disconnect changed the edit: %+v", second)
+	}
+	if got := envOf(t, path)[claudeEnableTelemetry]; got != "0" {
+		t.Errorf("edited switch = %q after second disconnect, want 0", got)
+	}
+}
+
+func TestConnectDoesNotWriteSettingsWhenJournalCannotBeSaved(t *testing.T) {
+	const original = `{"model":"opus"}`
+	c, path := claudeIn(t, original)
+
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("blocked"), 0o600); err != nil {
+		t.Fatalf("seed blocked journal parent: %v", err)
+	}
+	t.Setenv("MIRADOR_CONFIG_DIR", blocked)
+
+	if err := c.Connect(c.Render(fullExporter()), false); err == nil {
+		t.Fatal("Connect succeeded without being able to save its ownership journal")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	if string(data) != original {
+		t.Fatalf("settings changed before the journal was durable:\n%s", data)
+	}
+}
+
+func TestDisconnectRefusesCorruptJournal(t *testing.T) {
+	c, path := claudeIn(t, `{}`)
+	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	journalFile, err := journalPath(c.Name())
+	if err != nil {
+		t.Fatalf("journalPath: %v", err)
+	}
+	if err := os.WriteFile(journalFile, []byte(`{"installed":`), 0o600); err != nil {
+		t.Fatalf("corrupt journal: %v", err)
+	}
+
+	if _, err := c.Disconnect(); err == nil {
+		t.Fatal("Disconnect treated a corrupt ownership journal as an absent legacy journal")
+	}
+	if envOf(t, path)[otelHeaders] == "" {
+		t.Error("Disconnect changed settings despite the corrupt ownership journal")
+	}
 }
 
 func mustConfigPath(t *testing.T, c Claude) string {
@@ -591,6 +719,7 @@ func TestConnectRefusesADanglingSymlink(t *testing.T) {
 	}
 	dir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", filepath.Join(dir, "mirador"))
 
 	link := filepath.Join(dir, "settings.json")
 	missing := filepath.Join(t.TempDir(), "not-checked-out", "settings.json")
@@ -627,6 +756,7 @@ func TestDisconnectKeepsASymlinkTargetAlive(t *testing.T) {
 	dir := t.TempDir()
 	realDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", filepath.Join(dir, "mirador"))
 
 	target := filepath.Join(realDir, "settings.json")
 	if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 
@@ -38,6 +39,10 @@ type journal struct {
 	// Cleared holds conflicting settings --force removed, so disconnect can put those
 	// back too. They were never Mirador's, and taking them was the price of connecting.
 	Cleared map[string]string `json:"cleared,omitempty"`
+	// ClearedSettings is the same record for top-level settings. Keeping these separate
+	// from Cleared matters: restoring a setting such as otelHeadersHelper inside `env`
+	// produces a different, invalid configuration.
+	ClearedSettings map[string]string `json:"cleared_settings,omitempty"`
 }
 
 func journalPath(harness string) (string, error) {
@@ -65,9 +70,18 @@ func loadJournal(harness string) (*journal, error) {
 
 	var j journal
 	if err := json.Unmarshal(data, &j); err != nil {
-		// A corrupt journal must not wedge disconnect: treat it as absent and fall back
-		// to removing the managed keys.
-		return nil, nil
+		// Absence means an older install and permits the legacy removal path. Corruption
+		// is different: silently treating a damaged ownership record as absent would let
+		// disconnect delete values that a user changed after connecting.
+		return nil, fmt.Errorf("parse %s: %w (repair or remove it explicitly, then retry)", path, err)
+	}
+	if j.Harness != harness || j.ConfigPath == "" || j.Installed == nil || j.Previous == nil {
+		return nil, fmt.Errorf("parse %s: incomplete telemetry journal (repair or remove it explicitly, then retry)", path)
+	}
+	for key := range j.Installed {
+		if _, ok := j.Previous[key]; !ok {
+			return nil, fmt.Errorf("parse %s: missing previous value for %s (repair or remove it explicitly, then retry)", path, key)
+		}
 	}
 	return &j, nil
 }
@@ -99,16 +113,61 @@ func deleteJournal(harness string) error {
 	return nil
 }
 
-// newJournal captures the state of env before a connect overwrites it.
-func newJournal(harnessName, configPath string, existing, installing map[string]string, cleared map[string]string) *journal {
+// newJournal captures the state before a connect overwrites it. When this is a
+// reconnect, previous carries the original ownership chain forward: values that still
+// match the prior install retain their pre-Mirador value, while values edited since the
+// prior connect become the new value to restore after this explicit reconnect.
+func newJournal(
+	harnessName, configPath string,
+	existing, installing map[string]string,
+	cleared, clearedSettings map[string]string,
+	previous *journal,
+) *journal {
 	j := &journal{
-		Harness:    harnessName,
-		ConfigPath: configPath,
-		Installed:  make(map[string]string, len(installing)),
-		Previous:   make(map[string]*string, len(installing)),
+		Harness:         harnessName,
+		ConfigPath:      configPath,
+		Installed:       make(map[string]string, len(installing)),
+		Previous:        make(map[string]*string, len(installing)),
+		Cleared:         map[string]string{},
+		ClearedSettings: map[string]string{},
 	}
+
+	// Carry keys from an earlier connect that this connect does not write. Render can
+	// omit a conditional key (for example the traces beta switch), but disconnect still
+	// owns it if it remains unchanged in the file.
+	if previous != nil {
+		for key, installed := range previous.Installed {
+			if _, overwritten := installing[key]; overwritten {
+				continue
+			}
+			j.Installed[key] = installed
+			j.Previous[key] = cloneString(previous.Previous[key])
+		}
+		maps.Copy(j.Cleared, previous.Cleared)
+		maps.Copy(j.ClearedSettings, previous.ClearedSettings)
+	}
+
 	for key, value := range installing {
 		j.Installed[key] = value
+		if previous != nil {
+			if priorInstalled, owned := previous.Installed[key]; owned {
+				current, present := existing[key]
+				if present && current == priorInstalled {
+					j.Previous[key] = cloneString(previous.Previous[key])
+					continue
+				}
+				// The value was edited or removed after the earlier connect. This
+				// reconnect deliberately overwrites that edit, so restore the edit—not
+				// stale pre-history—when it is later disconnected.
+				if present {
+					current := current
+					j.Previous[key] = &current
+				} else {
+					j.Previous[key] = nil
+				}
+				continue
+			}
+		}
 		if prior, ok := existing[key]; ok {
 			// Copied, not aliased: the loop variable would otherwise be shared.
 			prior := prior
@@ -117,10 +176,17 @@ func newJournal(harnessName, configPath string, existing, installing map[string]
 			j.Previous[key] = nil
 		}
 	}
-	if len(cleared) > 0 {
-		j.Cleared = cleared
-	}
+	maps.Copy(j.Cleared, cleared)
+	maps.Copy(j.ClearedSettings, clearedSettings)
 	return j
+}
+
+func cloneString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 // apply undoes the connect against env, and reports what it did.
@@ -128,16 +194,23 @@ func newJournal(harnessName, configPath string, existing, installing map[string]
 // A key is only touched when it still holds the value Mirador installed. Anything else
 // is somebody's later edit — possibly the whole reason they are disconnecting — and
 // silently discarding it would be the same class of bug as never having journaled.
-func (j *journal) apply(env map[string]string) DisconnectResult {
+func (j *journal) apply(env map[string]string) (DisconnectResult, *journal) {
 	var result DisconnectResult
+	remaining := &journal{
+		Harness:         j.Harness,
+		ConfigPath:      j.ConfigPath,
+		Installed:       map[string]string{},
+		Previous:        map[string]*string{},
+		Cleared:         map[string]string{},
+		ClearedSettings: map[string]string{},
+	}
 
 	for key, installed := range j.Installed {
 		current, present := env[key]
-		if !present {
-			continue
-		}
-		if current != installed {
+		if !present || current != installed {
 			result.Skipped = append(result.Skipped, key)
+			remaining.Installed[key] = installed
+			remaining.Previous[key] = cloneString(j.Previous[key])
 			continue
 		}
 
@@ -155,7 +228,14 @@ func (j *journal) apply(env map[string]string) DisconnectResult {
 		if _, taken := env[key]; !taken {
 			env[key] = value
 			result.Restored++
+		} else {
+			result.Skipped = append(result.Skipped, key)
+			remaining.Cleared[key] = value
 		}
 	}
-	return result
+	return result, remaining
+}
+
+func (j *journal) empty() bool {
+	return len(j.Installed) == 0 && len(j.Cleared) == 0 && len(j.ClearedSettings) == 0
 }

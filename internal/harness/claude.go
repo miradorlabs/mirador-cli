@@ -3,10 +3,12 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -269,12 +271,27 @@ func (c Claude) Status() (Status, error) {
 	status.KeyPrefix = maskKeyFromHeaders(s.env[otelHeaders])
 	status.ProjectID = resourceAttribute(s.env[otelResourceAttributes], AttrProjectID)
 
-	// Counted whether or not the harness reports as connected: a config with telemetry
-	// switched off but the key still present has managed keys to clean up, and that is
-	// precisely the state disconnect must not walk away from.
-	for _, key := range claudeManagedKeys {
-		if _, ok := s.env[key]; ok {
-			status.ManagedKeys++
+	// With a journal, ownership is value-based: a key edited since connect is the user's
+	// and must not make a later disconnect fall back to deleting it. Without a journal,
+	// retain the legacy name-based count so older installations can still be cleaned up.
+	j, err := loadJournal(c.Name())
+	if err != nil {
+		return Status{}, err
+	}
+	if j != nil {
+		if j.ConfigPath != path {
+			return Status{}, fmt.Errorf("telemetry journal belongs to %s, not %s", j.ConfigPath, path)
+		}
+		for key, installed := range j.Installed {
+			if current, ok := s.env[key]; ok && current == installed {
+				status.ManagedKeys++
+			}
+		}
+	} else {
+		for _, key := range claudeManagedKeys {
+			if _, ok := s.env[key]; ok {
+				status.ManagedKeys++
+			}
 		}
 	}
 
@@ -294,6 +311,18 @@ func (c Claude) ConflictsWith(e Exporter) ([]Conflict, error) {
 	path, err := c.ConfigPath()
 	if err != nil {
 		return nil, err
+	}
+	j, err := loadJournal(c.Name())
+	if err != nil {
+		return nil, err
+	}
+	if j != nil && j.ConfigPath != path {
+		// This runs before key minting. Refuse here rather than later in Connect, where
+		// discovering the single harness journal belongs to another config would strand a
+		// freshly created server key.
+		return nil, fmt.Errorf(
+			"telemetry journal belongs to %s, not %s — disconnect that configuration before connecting this one",
+			j.ConfigPath, path)
 	}
 	s, err := loadSettings(path)
 	if err != nil {
@@ -438,8 +467,18 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 	if err != nil {
 		return err
 	}
+	previousJournal, err := loadJournal(c.Name())
+	if err != nil {
+		return err
+	}
+	if previousJournal != nil && previousJournal.ConfigPath != path {
+		return fmt.Errorf(
+			"telemetry journal belongs to %s, not %s — disconnect that configuration before connecting this one",
+			previousJournal.ConfigPath, path)
+	}
 
 	cleared := map[string]string{}
+	clearedSettings := map[string]string{}
 	if clearConflicts {
 		for _, conflict := range claudeConflicts(s.env, s.root, exporterFromEnv(env)) {
 			// Only this file's settings are Mirador's to touch. A shell export or a
@@ -455,7 +494,7 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 			}
 			if conflict.Key == claudeOtelHeadersHelper {
 				delete(s.root, claudeOtelHeadersHelper)
-				cleared[claudeOtelHeadersHelper] = conflict.Value
+				clearedSettings[claudeOtelHeadersHelper] = conflict.Value
 				continue
 			}
 			if value, ok := s.env[conflict.Key]; ok {
@@ -475,17 +514,31 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 
 	// Recorded before the merge overwrites anything, so disconnect can put the previous
 	// values back rather than inferring which keys were Mirador's.
-	j := newJournal(c.Name(), path, s.env, env, cleared)
+	j := newJournal(c.Name(), path, s.env, env, cleared, clearedSettings, previousJournal)
 
+	// Persist ownership first. If this fails, the credential-bearing settings have not
+	// changed. A crash after this point but before the settings write leaves a harmless
+	// journal whose installed values do not match, rather than an unjournaled credential.
+	if err := j.save(); err != nil {
+		return err
+	}
 	s.merge(env)
 	// tighten: the merged env carries the server key.
 	if err := s.save(true); err != nil {
+		// Put the preceding journal back so a failed reconnect does not replace the
+		// ownership record for the still-current installation.
+		var rollbackErr error
+		if previousJournal != nil {
+			rollbackErr = previousJournal.save()
+		} else {
+			rollbackErr = deleteJournal(c.Name())
+		}
+		if rollbackErr != nil {
+			return fmt.Errorf("write settings: %w (also failed to restore telemetry journal: %v)", err, rollbackErr)
+		}
 		return err
 	}
-	// After the write, so a failed connect leaves no record of changes that never
-	// happened. A journal that cannot be written is not fatal — the connect succeeded,
-	// and disconnect falls back to removing the managed keys.
-	return j.save()
+	return nil
 }
 
 // Disconnect undoes what the recorded connect did.
@@ -511,29 +564,46 @@ func (c Claude) Disconnect() (DisconnectResult, error) {
 	}
 
 	var result DisconnectResult
+	var remaining *journal
 	switch {
 	case j != nil && j.ConfigPath == path:
-		result = j.apply(s.env)
-		if helper, ok := j.Cleared[claudeOtelHeadersHelper]; ok {
-			if _, taken := s.root[claudeOtelHeadersHelper]; !taken {
-				if encoded, err := json.Marshal(helper); err == nil {
-					s.root[claudeOtelHeadersHelper] = encoded
-					result.Restored++
-				}
+		result, remaining = j.apply(s.env)
+		for key, value := range j.ClearedSettings {
+			if _, taken := s.root[key]; taken {
+				result.Skipped = append(result.Skipped, key)
+				remaining.ClearedSettings[key] = value
+				continue
 			}
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return result, err
+			}
+			s.root[key] = encoded
+			result.Restored++
 		}
+	case j != nil:
+		return DisconnectResult{}, fmt.Errorf(
+			"telemetry journal belongs to %s, not %s — refusing an unjournaled removal",
+			j.ConfigPath, path)
 	default:
 		// No record, or one written against a different config file.
 		result.Removed = s.remove(claudeManagedKeys)
 		result.Unjournaled = true
 	}
 
-	if result.Removed == 0 && result.Restored == 0 {
+	sort.Strings(result.Skipped)
+	if result.Removed > 0 || result.Restored > 0 {
+		// The credential is gone, so there is nothing left to tighten for.
+		if err := s.save(false); err != nil {
+			return result, err
+		}
+	}
+
+	if j == nil {
 		return result, nil
 	}
-	// The credential is gone, so there is nothing left to tighten for.
-	if err := s.save(false); err != nil {
-		return result, err
+	if remaining != nil && !remaining.empty() {
+		return result, remaining.save()
 	}
 	return result, deleteJournal(c.Name())
 }

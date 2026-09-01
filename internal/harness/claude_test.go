@@ -17,6 +17,10 @@ func claudeIn(t *testing.T, contents string) (Claude, string) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	// Connect also writes its ownership journal. Keep that out of the developer's real
+	// ~/.mirador directory: overwriting a live journal here would make a later real
+	// disconnect lose the values it is supposed to restore.
+	t.Setenv("MIRADOR_CONFIG_DIR", filepath.Join(dir, "mirador"))
 
 	path := filepath.Join(dir, "settings.json")
 	if contents != "" {
