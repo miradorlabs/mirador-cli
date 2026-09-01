@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -456,19 +457,119 @@ func TestStatusCountsManagedKeysWhenNotConnected(t *testing.T) {
 	}
 
 	// And disconnect must actually clear it.
-	removed, err := c.Disconnect()
+	result, err := c.Disconnect()
 	if err != nil {
 		t.Fatalf("Disconnect: %v", err)
 	}
-	if removed == 0 {
-		t.Fatal("disconnect removed nothing from a config that still held the key")
+	if result.Removed+result.Restored == 0 {
+		t.Fatal("disconnect changed nothing in a config that still held the key")
 	}
+
 	after, err := c.Status()
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
-	if after.ManagedKeys != 0 || after.KeyPrefix != "" {
-		t.Fatalf("settings survived disconnect: %+v", after)
+	// The credential is the part that must not survive.
+	if after.KeyPrefix != "" {
+		t.Fatalf("the server key survived disconnect: %+v", after)
+	}
+
+	// The one key deliberately left behind is the switch the user themselves set to 0
+	// after connecting. Its value is no longer what Mirador installed, so it is their
+	// edit — the same rule that stops disconnect deleting a collector someone
+	// reconfigured. It is reported rather than silently kept.
+	if !slices.Contains(result.Skipped, claudeEnableTelemetry) {
+		t.Errorf("skipped = %v, want the user-edited switch reported", result.Skipped)
+	}
+	env := envOf(t, mustConfigPath(t, c))
+	if env[claudeEnableTelemetry] != "0" {
+		t.Errorf("%s = %q, want the user's own value preserved", claudeEnableTelemetry, env[claudeEnableTelemetry])
+	}
+	for _, key := range claudeManagedKeys {
+		if key == claudeEnableTelemetry {
+			continue
+		}
+		if _, ok := env[key]; ok {
+			t.Errorf("%s survived disconnect", key)
+		}
+	}
+}
+
+// A key Mirador installed and nobody touched is restored to whatever it held before —
+// including "absent". A key edited since is left alone, which is what stops a disconnect
+// deleting a collector somebody reconfigured after connecting.
+func TestDisconnectRestoresPreviousValuesAndSkipsEdits(t *testing.T) {
+	c, path := claudeIn(t, `{"env":{
+		"OTEL_EXPORTER_OTLP_ENDPOINT":"https://their-collector.example.com",
+		"OTEL_LOG_USER_PROMPTS":"1"
+	}}`)
+
+	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Somebody repoints the export after connecting.
+	s, err := loadSettings(path)
+	if err != nil {
+		t.Fatalf("loadSettings: %v", err)
+	}
+	s.env[otelResourceAttributes] = "service.name=something-else"
+	if err := s.save(false); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	result, err := c.Disconnect()
+	if err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+
+	env := envOf(t, path)
+	// Present before Mirador: restored to the original values, not deleted.
+	if env[otelEndpoint] != "https://their-collector.example.com" {
+		t.Errorf("%s = %q, want the pre-Mirador collector restored", otelEndpoint, env[otelEndpoint])
+	}
+	if env[otelLogUserPrompts] != "1" {
+		t.Errorf("%s = %q, want the pre-Mirador value restored", otelLogUserPrompts, env[otelLogUserPrompts])
+	}
+	// Absent before Mirador: removed.
+	if _, ok := env[otelHeaders]; ok {
+		t.Errorf("%s survived; it did not exist before the connect", otelHeaders)
+	}
+	// Edited after the connect: left alone and reported.
+	if env[otelResourceAttributes] != "service.name=something-else" {
+		t.Errorf("%s = %q, want the later edit preserved", otelResourceAttributes, env[otelResourceAttributes])
+	}
+	if !slices.Contains(result.Skipped, otelResourceAttributes) {
+		t.Errorf("skipped = %v, want the edited key reported", result.Skipped)
+	}
+	if result.Restored == 0 {
+		t.Error("nothing was reported as restored")
+	}
+}
+
+// --force takes settings that were never Mirador's. Disconnect gives them back.
+func TestDisconnectRestoresClearedConflicts(t *testing.T) {
+	c, path := claudeIn(t, `{
+		"otelHeadersHelper": "/usr/local/bin/headers.sh",
+		"env":{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":"https://other-collector.example.com"}
+	}`)
+
+	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if _, ok := envOf(t, path)["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]; ok {
+		t.Fatal("--force did not clear the override")
+	}
+
+	if _, err := c.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+
+	if got := envOf(t, path)["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]; got != "https://other-collector.example.com" {
+		t.Errorf("cleared override = %q, want it restored", got)
+	}
+	if got := readJSON(t, path)["otelHeadersHelper"]; got != "/usr/local/bin/headers.sh" {
+		t.Errorf("otelHeadersHelper = %v, want it restored", got)
 	}
 }
 
@@ -561,5 +662,138 @@ func TestDisconnectKeepsASymlinkTargetAlive(t *testing.T) {
 	}
 	if st.ManagedKeys != 0 {
 		t.Errorf("managed keys survived: %d", st.ManagedKeys)
+	}
+}
+
+// Claude Code resolves settings from several files, and the user file Mirador writes is
+// the lowest-precedence of them. A project file wins — so a conflict there decides where
+// telemetry goes while the user file supplies Mirador's Authorization header.
+func TestConflictsDetectProjectSettings(t *testing.T) {
+	c, _ := claudeIn(t, "")
+
+	// A repository root, so the upward walk stops here.
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".claude"), 0o755); err != nil {
+		t.Fatalf("mkdir .claude: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".claude", "settings.json"),
+		[]byte(`{"env":{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":"https://project-collector.example.com"}}`), 0o644); err != nil {
+		t.Fatalf("seed project settings: %v", err)
+	}
+	t.Chdir(repo)
+
+	conflicts, err := c.ConflictsWith(miradorExporter())
+	if err != nil {
+		t.Fatalf("ConflictsWith: %v", err)
+	}
+	if len(conflicts) != 1 {
+		t.Fatalf("got %+v, want the project override reported", conflicts)
+	}
+	if conflicts[0].Scope != ScopeProject {
+		t.Errorf("scope = %q, want %q", conflicts[0].Scope, ScopeProject)
+	}
+	// Mirador writes the user file; it has no business editing a project's settings, and
+	// --force must not claim to have handled this.
+	if conflicts[0].Clearable {
+		t.Error("a project setting must not be reported as clearable")
+	}
+	if !conflicts[0].Credential {
+		t.Error("a foreign per-signal endpoint is a credential disclosure wherever it is set")
+	}
+}
+
+// A variable exported in the shell takes effect regardless of what is written to any
+// settings file, and Mirador cannot unset it for the user.
+func TestConflictsDetectShellEnvironment(t *testing.T) {
+	c, _ := claudeIn(t, "")
+	t.Chdir(t.TempDir())
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://shell-collector.example.com")
+
+	conflicts, err := c.ConflictsWith(miradorExporter())
+	if err != nil {
+		t.Fatalf("ConflictsWith: %v", err)
+	}
+	if len(conflicts) != 1 {
+		t.Fatalf("got %+v, want the exported variable reported", conflicts)
+	}
+	if conflicts[0].Scope != ScopeEnvironment {
+		t.Errorf("scope = %q, want %q", conflicts[0].Scope, ScopeEnvironment)
+	}
+	if conflicts[0].Clearable {
+		t.Error("Mirador cannot unset a shell export; it must not be reported as clearable")
+	}
+}
+
+// An exported value that already agrees with what Mirador would install is not a
+// conflict — the check must not fire on its own configuration.
+func TestConflictsIgnoreMatchingShellEnvironment(t *testing.T) {
+	c, _ := claudeIn(t, "")
+	t.Chdir(t.TempDir())
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", miradorEndpoint+"/v1/traces")
+
+	conflicts, err := c.ConflictsWith(miradorExporter())
+	if err != nil {
+		t.Fatalf("ConflictsWith: %v", err)
+	}
+	if len(conflicts) != 0 {
+		t.Fatalf("got %+v, want none", conflicts)
+	}
+}
+
+// otelHeadersHelper is a top-level setting, not an env entry, so a scan of the env block
+// never sees it — while it decides what the export authenticates with.
+func TestConflictsDetectOtelHeadersHelper(t *testing.T) {
+	c, _ := claudeIn(t, `{"otelHeadersHelper":"/usr/local/bin/headers.sh"}`)
+	t.Chdir(t.TempDir())
+
+	conflicts, err := c.ConflictsWith(miradorExporter())
+	if err != nil {
+		t.Fatalf("ConflictsWith: %v", err)
+	}
+	if len(conflicts) != 1 || conflicts[0].Key != "otelHeadersHelper" {
+		t.Fatalf("got %+v, want the headers helper reported", conflicts)
+	}
+	if !conflicts[0].Credential {
+		t.Error("a helper that supplies the Authorization header is a credential conflict")
+	}
+	// It is in the user file, so --force can take it.
+	if !conflicts[0].Clearable {
+		t.Error("a helper in the user's own settings should be clearable")
+	}
+}
+
+func TestConnectClearsOtelHeadersHelperWhenAsked(t *testing.T) {
+	c, path := claudeIn(t, `{"model":"opus","otelHeadersHelper":"/usr/local/bin/headers.sh"}`)
+	t.Chdir(t.TempDir())
+
+	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	doc := readJSON(t, path)
+	if _, ok := doc["otelHeadersHelper"]; ok {
+		t.Error("otelHeadersHelper survived --force and would still supply the headers")
+	}
+	if doc["model"] != "opus" {
+		t.Error("--force removed an unrelated top-level setting")
+	}
+}
+
+// A saved beta endpoint with the switch off does nothing, so blocking on it is a false
+// positive that also talks --force into deleting two settings for no reason.
+func TestConflictsIgnoreDormantBetaTracing(t *testing.T) {
+	c, _ := claudeIn(t, `{"env":{
+		"BETA_TRACING_ENDPOINT":"https://beta-collector.example.com"
+	}}`)
+	t.Chdir(t.TempDir())
+
+	conflicts, err := c.ConflictsWith(miradorExporter())
+	if err != nil {
+		t.Fatalf("ConflictsWith: %v", err)
+	}
+	if len(conflicts) != 0 {
+		t.Fatalf("got %+v, want none — ENABLE_BETA_TRACING_DETAILED is not set", conflicts)
 	}
 }

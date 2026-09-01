@@ -230,12 +230,14 @@ func TestDisconnectRemovesOnlyManagedKeys(t *testing.T) {
 	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	removed, err := c.Disconnect()
+	result, err := c.Disconnect()
 	if err != nil {
 		t.Fatalf("Disconnect: %v", err)
 	}
-	if removed != len(claudeManagedKeys) {
-		t.Errorf("removed %d keys, want %d", removed, len(claudeManagedKeys))
+	// Every managed key was absent before this connect, so undoing it removes them all
+	// rather than restoring anything.
+	if result.Removed != len(claudeManagedKeys) {
+		t.Errorf("removed %d keys, want %d", result.Removed, len(claudeManagedKeys))
 	}
 
 	env := envOf(t, path)
@@ -276,12 +278,12 @@ func TestDisconnectRestoresAnUntouchedFile(t *testing.T) {
 func TestDisconnectOnCleanFileIsANoop(t *testing.T) {
 	c, _ := claudeIn(t, `{"model":"opus"}`)
 
-	removed, err := c.Disconnect()
+	result, err := c.Disconnect()
 	if err != nil {
 		t.Fatalf("Disconnect: %v", err)
 	}
-	if removed != 0 {
-		t.Errorf("removed %d keys from a file that was never connected", removed)
+	if result.Removed != 0 || result.Restored != 0 {
+		t.Errorf("disconnect changed %d keys in a file that was never connected", result.Removed+result.Restored)
 	}
 }
 

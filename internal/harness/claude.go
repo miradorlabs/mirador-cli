@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,6 +68,13 @@ const (
 	// do the check itself.
 	claudeBetaTracingDetailed = "ENABLE_BETA_TRACING_DETAILED"
 	claudeBetaTracingEndpoint = "BETA_TRACING_ENDPOINT"
+
+	// claudeOtelHeadersHelper names a script that generates OTLP headers dynamically.
+	// It is a *top-level* setting rather than an env entry, so a scan of the `env` block
+	// never sees it — and it supplies the same Authorization header Mirador writes,
+	// which means an existing helper decides what the export authenticates with while
+	// Mirador reports itself connected.
+	claudeOtelHeadersHelper = "otelHeadersHelper"
 )
 
 // perSignalOverrides are the variables that take precedence over the generic ones
@@ -272,7 +280,7 @@ func (c Claude) Status() (Status, error) {
 
 	// Compared against the endpoint actually configured here, so status reports whether
 	// this file is internally consistent — not whether it agrees with some other project.
-	status.Conflicts = claudeConflicts(s.env, Exporter{
+	status.Conflicts = claudeConflicts(s.env, s.root, Exporter{
 		Endpoint: status.Endpoint,
 		Signals:  status.Signals,
 	})
@@ -291,7 +299,7 @@ func (c Claude) ConflictsWith(e Exporter) ([]Conflict, error) {
 	if err != nil {
 		return nil, err
 	}
-	return claudeConflicts(s.env, e), nil
+	return claudeConflicts(s.env, s.root, e), nil
 }
 
 // claudeConflicts finds every setting that would send data — and with it Mirador's
@@ -299,8 +307,20 @@ func (c Claude) ConflictsWith(e Exporter) ([]Conflict, error) {
 //
 // e describes the export that will be in effect: the one about to be written during a
 // connect, or the one already on disk when reporting status.
-func claudeConflicts(env map[string]string, e Exporter) []Conflict {
+func claudeConflicts(env map[string]string, root map[string]json.RawMessage, e Exporter) []Conflict {
 	var out []Conflict
+
+	// Not an env entry, so nothing above would find it.
+	if helper := stringSetting(root, claudeOtelHeadersHelper); helper != "" {
+		out = append(out, Conflict{
+			Key:        claudeOtelHeadersHelper,
+			Value:      helper,
+			Reason:     "supplies its own OTLP headers, which decide what the export authenticates with instead of Mirador's key",
+			Credential: true,
+			Scope:      ScopeUserSettings,
+			Clearable:  true,
+		})
+	}
 
 	// The generic endpoint pointing at another collector is not a disclosure — it is
 	// overwritten — but a connect would replace an export the user set up. Reported
@@ -311,7 +331,10 @@ func claudeConflicts(env map[string]string, e Exporter) []Conflict {
 		if !isOn(env[claudeEnableTelemetry]) {
 			reason = "a previously configured destination; connecting replaces it"
 		}
-		out = append(out, Conflict{Key: otelEndpoint, Value: current, Reason: reason})
+		out = append(out, Conflict{
+			Key: otelEndpoint, Value: current, Reason: reason,
+			Scope: ScopeUserSettings, Clearable: true,
+		})
 	}
 
 	for _, o := range perSignalOverrides {
@@ -333,21 +356,27 @@ func claudeConflicts(env map[string]string, e Exporter) []Conflict {
 				Value:      v,
 				Reason:     reason,
 				Credential: v != e.Endpoint,
+				Scope:      ScopeUserSettings,
+				Clearable:  true,
 			})
 		}
 		if v := env[o.headers]; v != "" {
 			// The value is a header bag that may itself hold a credential, so it is
 			// named but never printed.
 			out = append(out, Conflict{
-				Key:    o.headers,
-				Reason: "merges into the headers for " + string(o.signal) + ", overriding Mirador's",
+				Key:       o.headers,
+				Reason:    "merges into the headers for " + string(o.signal) + ", overriding Mirador's",
+				Scope:     ScopeUserSettings,
+				Clearable: true,
 			})
 		}
 		if v := env[o.protocol]; v != "" && v != protocolHTTPProtobuf {
 			out = append(out, Conflict{
-				Key:    o.protocol,
-				Value:  v,
-				Reason: "sends " + string(o.signal) + " over a protocol Mirador's endpoint does not serve",
+				Key:       o.protocol,
+				Value:     v,
+				Reason:    "sends " + string(o.signal) + " over a protocol Mirador's endpoint does not serve",
+				Scope:     ScopeUserSettings,
+				Clearable: true,
 			})
 		}
 	}
@@ -355,7 +384,12 @@ func claudeConflicts(env map[string]string, e Exporter) []Conflict {
 	// Detailed beta tracing diverts logs and traces to its own endpoint instead of the
 	// exporters, so it defeats the connect without touching a single OTEL_* variable.
 	// Only logs and traces move; a metrics-only connect is unaffected.
+	//
+	// Both halves are required for it to do anything: a saved endpoint with the switch
+	// off is dormant, and blocking on that would be a false positive that also talks
+	// --force into deleting two settings for no reason.
 	if endpoint := env[claudeBetaTracingEndpoint]; endpoint != "" &&
+		isOn(env[claudeBetaTracingDetailed]) &&
 		(e.HasSignal(SignalTraces) || e.HasSignal(SignalLogs)) {
 		out = append(out, Conflict{
 			Key:    claudeBetaTracingEndpoint,
@@ -365,9 +399,28 @@ func claudeConflicts(env map[string]string, e Exporter) []Conflict {
 			// yes: the safe assumption for a redirect is that the credential follows it,
 			// and Anthropic's managed settings strip this variable alongside credentials.
 			Credential: true,
+			Scope:      ScopeUserSettings,
+			Clearable:  true,
 		})
 	}
+
+	// Everything above is in the file Mirador owns. These are not, and outrank it.
+	out = append(out, environmentConflicts(e)...)
+	out = append(out, projectConflicts(e)...)
 	return out
+}
+
+// stringSetting reads a top-level string out of the raw document.
+func stringSetting(root map[string]json.RawMessage, key string) string {
+	raw, ok := root[key]
+	if !ok {
+		return ""
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	return value
 }
 
 // Connect merges Mirador's variables into the settings file, leaving every other
@@ -386,43 +439,103 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 		return err
 	}
 
+	cleared := map[string]string{}
 	if clearConflicts {
-		for _, conflict := range claudeConflicts(s.env, exporterFromEnv(env)) {
+		for _, conflict := range claudeConflicts(s.env, s.root, exporterFromEnv(env)) {
+			// Only this file's settings are Mirador's to touch. A shell export or a
+			// project file is somebody else's, and the caller refuses the connect rather
+			// than pretending --force dealt with it.
+			if !conflict.Clearable {
+				continue
+			}
 			// The generic endpoint is about to be overwritten by the merge anyway;
 			// deleting it here would be a no-op with a confusing name.
 			if conflict.Key == otelEndpoint {
 				continue
 			}
+			if conflict.Key == claudeOtelHeadersHelper {
+				delete(s.root, claudeOtelHeadersHelper)
+				cleared[claudeOtelHeadersHelper] = conflict.Value
+				continue
+			}
+			if value, ok := s.env[conflict.Key]; ok {
+				cleared[conflict.Key] = value
+			}
 			delete(s.env, conflict.Key)
 			// The beta-tracing switch and its endpoint are a pair — the switch alone
 			// does nothing, so leaving it behind would just be dead config.
 			if conflict.Key == claudeBetaTracingEndpoint {
+				if value, ok := s.env[claudeBetaTracingDetailed]; ok {
+					cleared[claudeBetaTracingDetailed] = value
+				}
 				delete(s.env, claudeBetaTracingDetailed)
 			}
 		}
 	}
 
+	// Recorded before the merge overwrites anything, so disconnect can put the previous
+	// values back rather than inferring which keys were Mirador's.
+	j := newJournal(c.Name(), path, s.env, env, cleared)
+
 	s.merge(env)
 	// tighten: the merged env carries the server key.
-	return s.save(true)
+	if err := s.save(true); err != nil {
+		return err
+	}
+	// After the write, so a failed connect leaves no record of changes that never
+	// happened. A journal that cannot be written is not fatal — the connect succeeded,
+	// and disconnect falls back to removing the managed keys.
+	return j.save()
 }
 
-// Disconnect removes only the keys Mirador set.
-func (c Claude) Disconnect() (int, error) {
+// Disconnect undoes what the recorded connect did.
+//
+// With a journal it restores each key to the value it held beforehand and leaves alone
+// any key edited since — a config someone has adjusted is their decision, not stale
+// Mirador state. Without one (an older connect, a hand-edited config) it falls back to
+// removing the managed keys, which is the best that can be done without a record and is
+// reported as such.
+func (c Claude) Disconnect() (DisconnectResult, error) {
 	path, err := c.ConfigPath()
 	if err != nil {
-		return 0, err
+		return DisconnectResult{}, err
 	}
 	s, err := loadSettings(path)
 	if err != nil {
-		return 0, err
+		return DisconnectResult{}, err
 	}
-	removed := s.remove(claudeManagedKeys)
-	if removed == 0 {
-		return 0, nil
+
+	j, err := loadJournal(c.Name())
+	if err != nil {
+		return DisconnectResult{}, err
+	}
+
+	var result DisconnectResult
+	switch {
+	case j != nil && j.ConfigPath == path:
+		result = j.apply(s.env)
+		if helper, ok := j.Cleared[claudeOtelHeadersHelper]; ok {
+			if _, taken := s.root[claudeOtelHeadersHelper]; !taken {
+				if encoded, err := json.Marshal(helper); err == nil {
+					s.root[claudeOtelHeadersHelper] = encoded
+					result.Restored++
+				}
+			}
+		}
+	default:
+		// No record, or one written against a different config file.
+		result.Removed = s.remove(claudeManagedKeys)
+		result.Unjournaled = true
+	}
+
+	if result.Removed == 0 && result.Restored == 0 {
+		return result, nil
 	}
 	// The credential is gone, so there is nothing left to tighten for.
-	return removed, s.save(false)
+	if err := s.save(false); err != nil {
+		return result, err
+	}
+	return result, deleteJournal(c.Name())
 }
 
 // exporterFromEnv reconstructs the shape of a rendered env map, so code holding only
@@ -446,12 +559,19 @@ func exporterFromEnv(env map[string]string) Exporter {
 
 // Backup exposes the pre-modification copy so `connect` can tell the user where it is.
 //
-// endpoint is Mirador's own, and decides whether the existing file is worth snapshotting:
-// a config already pointing at Mirador is one this CLI wrote, so the stored backup is
-// still the pre-Mirador state and must be kept. A config pointing anywhere else is the
-// user's, and is what the backup should hold — including after a disconnect-and-
-// reconfigure cycle, where a never-overwritten backup would otherwise go stale and the
-// next disconnect would delete the only live copy.
+// Whether the stored backup may be replaced comes from the journal, not from what the
+// endpoint happens to say. Reading ownership off the endpoint gets it wrong both ways: a
+// config someone wrote by hand against the Mirador endpoint looks like Mirador's, so its
+// backup is kept stale and the config itself is later deleted; a Mirador config whose
+// endpoint was edited out looks like the user's, so it overwrites the real original.
+//
+// endpoint is retained for the no-journal case — an older connect, or a hand-edited
+// config — where the endpoint is the only evidence available.
+//
+// The rule the journal expresses: snapshot whatever Mirador did not write, and leave the
+// snapshot alone when re-connecting over a config this CLI installed — including after a
+// disconnect-and-reconfigure cycle, where a never-overwritten backup would otherwise go
+// stale and the next disconnect would delete the only live copy.
 func (c Claude) Backup(endpoint string) (string, error) {
 	path, err := c.ConfigPath()
 	if err != nil {
@@ -461,6 +581,17 @@ func (c Claude) Backup(endpoint string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	// A journal for this exact file means the current contents are Mirador's own work,
+	// so the stored backup is still the pre-Mirador state and must be kept.
+	j, err := loadJournal(c.Name())
+	if err != nil {
+		return "", err
+	}
+	if j != nil && j.ConfigPath == path {
+		return s.backup(false)
+	}
+	// No record: fall back to the endpoint, which is the only evidence there is.
 	return s.backup(s.env[otelEndpoint] != endpoint)
 }
 

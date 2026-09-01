@@ -28,7 +28,7 @@ func (c Codex) ConflictsWith(Exporter) ([]Conflict, error) { return nil, c.unsup
 
 func (c Codex) Connect(map[string]string, bool) error { return c.unsupported() }
 
-func (c Codex) Disconnect() (int, error) { return 0, c.unsupported() }
+func (c Codex) Disconnect() (DisconnectResult, error) { return DisconnectResult{}, c.unsupported() }
 
 func (c Codex) unsupported() error {
 	return &ErrUnsupported{

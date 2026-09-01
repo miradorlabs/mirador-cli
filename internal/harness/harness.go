@@ -164,6 +164,37 @@ type Conflict struct {
 	Reason string
 	// Credential is true when leaving this in place would disclose Mirador's key.
 	Credential bool
+
+	// Scope is where the setting was found. Only the harness's own user-level file is
+	// Mirador's to edit; a shell export or a project settings file belongs to someone
+	// else, and both take precedence over it.
+	Scope string
+	// Clearable reports whether Connect could remove this. A conflict that is not
+	// clearable is fatal even under --force: pretending to fix it would write the
+	// credential and leave the override in force.
+	Clearable bool
+}
+
+// Conflict scopes.
+const (
+	ScopeUserSettings = "user settings"
+	ScopeEnvironment  = "shell environment"
+	ScopeProject      = "project settings"
+)
+
+// DisconnectResult reports what a disconnect actually did. Removed and Restored are
+// counts of managed keys; Skipped names the ones deliberately left in place.
+type DisconnectResult struct {
+	// Removed is the count of Mirador keys taken out of the config.
+	Removed int
+	// Restored is the count put back to the value they held before Mirador ran.
+	Restored int
+	// Skipped names keys changed since Mirador wrote them. They are somebody's
+	// deliberate edit, so disconnect leaves them and says which.
+	Skipped []string
+	// Unjournaled is set when no record of the connect survived, so prior values could
+	// not be restored and the keys were simply removed.
+	Unjournaled bool
 }
 
 // Status is the currently-installed state, read back from the harness's own config.
@@ -230,8 +261,10 @@ type Harness interface {
 	// caller gates behind an explicit flag: they are the user's settings, not Mirador's.
 	Connect(env map[string]string, clearConflicts bool) error
 
-	// Disconnect removes only the keys this harness set, and reports how many went.
-	Disconnect() (int, error)
+	// Disconnect undoes a connect: keys Mirador installed and that still hold the value
+	// it wrote are restored to what they were before, and keys somebody has since
+	// changed are left alone.
+	Disconnect() (DisconnectResult, error)
 }
 
 // registry is fixed at compile time. A harness is a code-level integration — it has to

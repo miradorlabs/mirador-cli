@@ -139,6 +139,15 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 	printConnectPlan(out, h, cfg, detection, configPath, signals, f)
 	printConflicts(out, conflicts, f.force)
 
+	// A conflict outside the user file — exported in the shell, or set in a project
+	// settings file that outranks it — cannot be cleared by writing to the user file, so
+	// --force must not pretend otherwise. Connecting anyway would install the credential
+	// while the override kept deciding where telemetry goes.
+	if blocking := unclearable(conflicts); len(blocking) > 0 {
+		return fmt.Errorf(
+			"%s reads these from outside your user settings, where Mirador cannot change them: %s — unset or remove them, then retry",
+			h.DisplayName(), strings.Join(blocking, ", "))
+	}
 	if len(conflicts) > 0 && !f.force {
 		return fmt.Errorf(
 			"%s already has OTLP settings that would override this connect — remove them, or pass --force to have Mirador remove them",
@@ -299,9 +308,9 @@ func printConflicts(out io.Writer, conflicts []harness.Conflict, force bool) {
 	}
 
 	if force {
-		fmt.Fprintln(out, "  Conflicting settings, which --force will remove:")
+		fmt.Fprintln(out, "  Conflicting settings, which --force will remove where it can:")
 	} else {
-		fmt.Fprintln(out, "  Conflicting settings already in this config:")
+		fmt.Fprintln(out, "  Conflicting settings:")
 	}
 	for _, c := range conflicts {
 		if c.Value != "" {
@@ -313,9 +322,25 @@ func printConflicts(out io.Writer, conflicts []harness.Conflict, force bool) {
 		if c.Credential {
 			marker = "!"
 		}
-		fmt.Fprintf(out, "     %s %s\n", marker, c.Reason)
+		fmt.Fprintf(out, "     %s [%s] %s\n", marker, c.Scope, output.SanitizeTerminal(c.Reason))
+		if !c.Clearable {
+			// Say it here as well as in the error: this is the one the user has to go
+			// and fix themselves.
+			fmt.Fprintf(out, "       Mirador cannot change this — it is outside your user settings.\n")
+		}
 	}
 	fmt.Fprintln(out)
+}
+
+// unclearable names the conflicts --force cannot resolve, which are fatal.
+func unclearable(conflicts []harness.Conflict) []string {
+	var out []string
+	for _, c := range conflicts {
+		if !c.Clearable {
+			out = append(out, c.Key)
+		}
+	}
+	return out
 }
 
 // backupHarnessConfig snapshots the file before it is merged, when the harness exposes
@@ -521,11 +546,23 @@ masked prefix is printed so you can find it in the list.`,
 				}
 			}
 
-			removed, err := h.Disconnect()
+			result, err := h.Disconnect()
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(out, "\nDisconnected. Removed %d setting(s) from %s.\n", removed, st.ConfigPath)
+
+			fmt.Fprintf(out, "\nDisconnected. Removed %d setting(s) from %s.\n", result.Removed, st.ConfigPath)
+			if result.Restored > 0 {
+				fmt.Fprintf(out, "Restored %d setting(s) to the value held before Mirador connected.\n", result.Restored)
+			}
+			if len(result.Skipped) > 0 {
+				// Changed after the connect, so they are somebody's deliberate edit and
+				// not Mirador's to throw away.
+				fmt.Fprintf(out, "Left alone (changed since connecting): %s\n", strings.Join(result.Skipped, ", "))
+			}
+			if result.Unjournaled {
+				fmt.Fprintf(out, "No record of the original values survived, so they were removed rather than restored.\n")
+			}
 			fmt.Fprintf(out, "Restart %s for it to take effect.\n", h.DisplayName())
 			return nil
 		},
