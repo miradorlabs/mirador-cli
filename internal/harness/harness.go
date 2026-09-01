@@ -132,6 +132,25 @@ type Detection struct {
 	Path string
 }
 
+// Conflict is an existing setting that would send Mirador's credential somewhere
+// Mirador does not control, or would silently stop the export from working.
+//
+// These exist because OTLP is configurable per signal as well as generically, and the
+// per-signal values win. A harness carrying its own OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+// would keep exporting there while receiving the Authorization header Mirador wrote for
+// the generic endpoint — handing a live server key to a third-party collector.
+type Conflict struct {
+	// Key is the environment variable in the harness's config.
+	Key string
+	// Value is what it is currently set to. Never a credential: only keys whose values
+	// are endpoints or protocols are reported with one.
+	Value string
+	// Reason says what it would do, in terms a user can act on.
+	Reason string
+	// Credential is true when leaving this in place would disclose Mirador's key.
+	Credential bool
+}
+
 // Status is the currently-installed state, read back from the harness's own config.
 type Status struct {
 	// ConfigPath is the file consulted, whether or not it exists.
@@ -145,6 +164,14 @@ type Status struct {
 
 	IncludePrompts     bool
 	IncludeToolContent bool
+
+	// ManagedKeys counts the Mirador-written variables actually present. Disconnect
+	// keys off this rather than off Connected: telemetry switched off with the key
+	// still on disk is exactly the state that most needs cleaning up.
+	ManagedKeys int
+
+	// Conflicts are per-signal overrides that contradict the generic configuration.
+	Conflicts []Conflict
 
 	// KeyPrefix is the masked head of the configured key, never the key itself.
 	KeyPrefix string
@@ -173,8 +200,16 @@ type Harness interface {
 	// Status reads the config file back.
 	Status() (Status, error)
 
+	// ConflictsWith reports settings already in the config that would override or
+	// redirect an export aimed at endpoint. Called before Connect writes anything,
+	// because the dangerous case — a per-signal endpoint inheriting Mirador's
+	// Authorization header — is invisible once the credential is on disk.
+	ConflictsWith(endpoint string) ([]Conflict, error)
+
 	// Connect merges env into the config, preserving every setting it does not own.
-	Connect(env map[string]string) error
+	// Conflicting overrides are removed only when clearConflicts is set, which the
+	// caller gates behind an explicit flag: they are the user's settings, not Mirador's.
+	Connect(env map[string]string, clearConflicts bool) error
 
 	// Disconnect removes only the keys this harness set, and reports how many went.
 	Disconnect() (int, error)

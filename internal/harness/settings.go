@@ -20,6 +20,11 @@ import (
 // hand-written file once and is stable forever after.
 type settingsFile struct {
 	path string
+	// writePath is path with symlinks resolved. Writing goes here rather than to path,
+	// because the atomic rename replaces whatever name it is given — and for anyone
+	// keeping ~/.claude/settings.json as a link into a dotfiles repo, that would swap
+	// the link for a regular file and quietly detach the file from the repo.
+	writePath string
 	// root is the whole document; env is the nested object telemetry keys live in.
 	root map[string]json.RawMessage
 	env  map[string]string
@@ -43,10 +48,17 @@ const (
 // loadSettings reads a settings file, tolerating its absence.
 func loadSettings(path string) (*settingsFile, error) {
 	s := &settingsFile{
-		path: path,
-		root: map[string]json.RawMessage{},
-		env:  map[string]string{},
-		mode: settingsMode,
+		path:      path,
+		writePath: path,
+		root:      map[string]json.RawMessage{},
+		env:       map[string]string{},
+		mode:      settingsMode,
+	}
+
+	// A missing file, or a dangling link, resolves to nothing — keep the original name
+	// so a first connect creates it where it was asked to.
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		s.writePath = resolved
 	}
 
 	data, err := os.ReadFile(path)
@@ -126,15 +138,15 @@ func (s *settingsFile) save(tighten bool) error {
 		if !s.existed {
 			return nil
 		}
-		if err := os.Remove(s.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("remove %s: %w", s.path, err)
+		if err := os.Remove(s.writePath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove %s: %w", s.writePath, err)
 		}
 		return nil
 	}
 
 	data, err := json.MarshalIndent(s.root, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode %s: %w", s.path, err)
+		return fmt.Errorf("encode %s: %w", s.writePath, err)
 	}
 	data = append(data, '\n')
 
@@ -143,15 +155,21 @@ func (s *settingsFile) save(tighten bool) error {
 		mode = settingsMode
 	}
 
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", filepath.Dir(s.path), err)
+	if err := os.MkdirAll(filepath.Dir(s.writePath), 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", filepath.Dir(s.writePath), err)
 	}
-	return writeFileAtomic(s.path, data, mode)
+	return writeFileAtomic(s.writePath, data, mode)
 }
 
 // backup copies the current file alongside itself before the first modification. This
 // is a user's own configuration, possibly hand-written and possibly in a dotfiles repo;
 // a mangled merge should never be the only copy left.
+//
+// An existing backup is never overwritten. It is the pre-Mirador configuration, and it
+// is the only record of it: connect overwrites the telemetry variables and disconnect
+// deletes them, neither remembering what was there before. Overwriting on a re-connect
+// would replace that record with a copy of Mirador's own settings, so the second connect
+// would be what destroys the original — not the first.
 //
 // Best-effort by design: a failure to write the backup must not block the connect the
 // user asked for, so the caller reports it as a warning.
@@ -159,14 +177,20 @@ func (s *settingsFile) backup() (string, error) {
 	if !s.existed {
 		return "", nil
 	}
-	data, err := os.ReadFile(s.path)
+	// Alongside the real file, not the link that points at it.
+	path := s.writePath + ".mirador.bak"
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+
+	data, err := os.ReadFile(s.writePath)
 	if err != nil {
 		return "", err
 	}
-	// Written 0600 regardless of the source's mode. A re-connect backs up a file that
-	// already holds a server key, and inheriting a permissive mode there would copy that
-	// credential into a world-readable file.
-	path := s.path + ".mirador.bak"
+	// Written 0600 regardless of the source's mode: a backup of a connected config holds
+	// a server key, and inheriting a permissive mode would copy it somewhere readable.
 	if err := writeFileAtomic(path, data, settingsMode); err != nil {
 		return "", err
 	}

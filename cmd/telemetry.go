@@ -46,7 +46,9 @@ type connectFlags struct {
 	includeToolContent bool
 	keyName            string
 	apiKey             string
+	identity           string
 	assumeYes          bool
+	force              bool
 }
 
 func newTelemetryConnectCommand() *cobra.Command {
@@ -76,7 +78,9 @@ Pass --api-key to install a key you already hold instead of minting a new one.`,
 	fl.BoolVar(&f.includeToolContent, "include-tool-content", false, "also export tool parameters, input, and output")
 	fl.StringVar(&f.keyName, "key-name", "", "name for the minted key (defaults to <harness>@<hostname>)")
 	fl.StringVar(&f.apiKey, "api-key", "", "install this existing mir_srv_ key instead of minting a new one")
+	fl.StringVar(&f.identity, "identity", "", "value for enduser.id (defaults to your global git email; \"none\" to omit)")
 	fl.BoolVarP(&f.assumeYes, "yes", "y", false, "skip the confirmation prompt")
+	fl.BoolVar(&f.force, "force", false, "remove conflicting per-signal OTLP settings instead of refusing to connect")
 	return cmd
 }
 
@@ -115,7 +119,23 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 	out := cmd.OutOrStdout()
 	detection := h.Detect(ctx)
 
+	// Before anything is minted or written. A per-signal endpoint left in place would
+	// keep exporting to whoever owns it while inheriting the Authorization header Mirador
+	// is about to write for the generic endpoint — handing out a live server key. Once
+	// the key is on disk that is invisible, so it has to be caught here.
+	conflicts, err := h.ConflictsWith(cfg.OTLPURL)
+	if err != nil {
+		return err
+	}
+
 	printConnectPlan(out, h, cfg, detection, configPath, signals, f)
+	printConflicts(out, conflicts, f.force)
+
+	if len(conflicts) > 0 && !f.force {
+		return fmt.Errorf(
+			"%s already has OTLP settings that would override this connect — remove them, or pass --force to have Mirador remove them",
+			h.DisplayName())
+	}
 
 	if !f.assumeYes {
 		ok, err := confirm(cmd, fmt.Sprintf("Connect %s to Mirador?", h.DisplayName()))
@@ -145,11 +165,11 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 		Endpoint:           cfg.OTLPURL,
 		APIKey:             key,
 		Signals:            signals,
-		ResourceAttributes: resourceAttributes(ctx, h, cfg),
+		ResourceAttributes: resourceAttributes(ctx, h, cfg, f.identity),
 		IncludePrompts:     f.includePrompts,
 		IncludeToolContent: f.includeToolContent,
 	})
-	if err := h.Connect(env); err != nil {
+	if err := h.Connect(env, f.force); err != nil {
 		// The key was already minted at this point. Say so, so it can be revoked rather
 		// than left live and unaccounted for in the web app's key list.
 		if keyMeta.KeyPrefix != "" {
@@ -240,17 +260,58 @@ func resolveKey(ctx context.Context, cfg *config.Config, h harness.Harness, f co
 }
 
 // resourceAttributes are stamped on everything the harness emits.
-func resourceAttributes(ctx context.Context, h harness.Harness, cfg *config.Config) map[string]string {
+//
+// identity overrides the default enduser.id. The literal "none" omits it — worth having
+// because the default is a real email address written into a global config file, and
+// there is no other way to say "do not label my sessions".
+func resourceAttributes(ctx context.Context, h harness.Harness, cfg *config.Config, identity string) map[string]string {
 	attrs := map[string]string{
 		harness.AttrServiceName: harness.ServiceName(h),
 		harness.AttrProjectID:   cfg.ProjectID,
 	}
-	// git's email is the identity already attached to the work being traced. Resolved
-	// here and written as a literal — a config file holds strings, not shell.
-	if email := harness.GitEmail(ctx); email != "" {
-		attrs[harness.AttrEnduserID] = email
+
+	switch identity = strings.TrimSpace(identity); identity {
+	case "none":
+	case "":
+		// git's *global* email: this lands in a global config and labels every future
+		// session, so a repository-local address would follow the user out of the repo
+		// it was set in. Resolved here and written as a literal — config holds strings,
+		// not shell.
+		if email := harness.GitEmail(ctx); email != "" {
+			attrs[harness.AttrEnduserID] = email
+		}
+	default:
+		attrs[harness.AttrEnduserID] = identity
 	}
 	return attrs
+}
+
+// printConflicts explains what is in the way, naming each variable so the user can go
+// and look at it. A header value is never printed: it is the one that may hold someone
+// else's credential.
+func printConflicts(out io.Writer, conflicts []harness.Conflict, force bool) {
+	if len(conflicts) == 0 {
+		return
+	}
+
+	if force {
+		fmt.Fprintln(out, "  Conflicting settings, which --force will remove:")
+	} else {
+		fmt.Fprintln(out, "  Conflicting settings already in this config:")
+	}
+	for _, c := range conflicts {
+		if c.Value != "" {
+			fmt.Fprintf(out, "    %s=%s\n", c.Key, output.SanitizeTerminal(c.Value))
+		} else {
+			fmt.Fprintf(out, "    %s\n", c.Key)
+		}
+		marker := " "
+		if c.Credential {
+			marker = "!"
+		}
+		fmt.Fprintf(out, "     %s %s\n", marker, c.Reason)
+	}
+	fmt.Fprintln(out)
 }
 
 // backupHarnessConfig snapshots the file before it is merged, when the harness exposes
@@ -333,7 +394,11 @@ type telemetryStatus struct {
 	Signals     string `json:"signals,omitempty"`
 	Prompts     string `json:"prompts,omitempty"`
 	ToolContent string `json:"tool_content,omitempty"`
-	Error       string `json:"error,omitempty"`
+	// Conflicts names the per-signal overrides that make Endpoint above only part of
+	// the truth. Reporting a Mirador endpoint while a per-signal override quietly sends
+	// that signal — and the credential — elsewhere is the failure this exists to prevent.
+	Conflicts []string `json:"conflicts,omitempty"`
+	Error     string   `json:"error,omitempty"`
 }
 
 func describeStatus(ctx context.Context, h harness.Harness, cfg *config.Config) telemetryStatus {
@@ -363,11 +428,24 @@ func describeStatus(ctx context.Context, h harness.Harness, cfg *config.Config) 
 	entry.Endpoint = st.Endpoint
 	entry.ProjectID = st.ProjectID
 	entry.KeyPrefix = st.KeyPrefix
+	for _, c := range st.Conflicts {
+		entry.Conflicts = append(entry.Conflicts, c.Key)
+	}
 
 	switch {
 	case !st.Connected:
+		// Settings left behind after the switch was turned off still hold the key, and
+		// `disconnect` still has work to do — so this is not the same as "nothing here".
+		if st.ManagedKeys > 0 {
+			entry.State = "settings present, not exporting"
+			return entry
+		}
 		entry.State = "not connected"
 		return entry
+	case len(st.Conflicts) > 0:
+		// Say this rather than "connected": some signal is going somewhere else, and the
+		// endpoint column alone would be a lie.
+		entry.State = "connected, overridden"
 	case st.Endpoint != cfg.OTLPURL:
 		// Telemetry is on, but aimed somewhere else. Saying "connected" here would be
 		// wrong in the way that costs the most time to discover.
@@ -408,9 +486,16 @@ masked prefix is printed so you can find it in the list.`,
 			if err != nil {
 				return err
 			}
-			if !st.Connected {
-				fmt.Fprintf(out, "%s is not connected. Nothing to do.\n", h.DisplayName())
+			// Keyed off the settings actually present, not off Connected. A config with
+			// telemetry switched off, or with the endpoint deleted, is not "connected" —
+			// but it still has Mirador's server key sitting in it, and that is the state
+			// where walking away would be worst.
+			if st.ManagedKeys == 0 {
+				fmt.Fprintf(out, "%s has no Mirador telemetry settings. Nothing to do.\n", h.DisplayName())
 				return nil
+			}
+			if !st.Connected {
+				fmt.Fprintf(out, "%s is not exporting, but Mirador settings are still present.\n\n", h.DisplayName())
 			}
 
 			fmt.Fprintf(out, "This will remove Mirador's telemetry settings from:\n  %s\n", st.ConfigPath)

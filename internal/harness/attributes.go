@@ -38,12 +38,19 @@ func ServiceName(h Harness) string {
 	}
 }
 
-// GitEmail returns the email git would stamp on a commit here, or "" when git is
-// absent or unconfigured.
+// GitEmail returns the email from git's *global* configuration, or "" when git is
+// absent or has none set.
 //
-// This is read at connect time and written into the config as a literal. It cannot be
-// left as a shell substitution: harness config files hold literal strings, and a
-// `$(git config user.email)` written into one would be exported verbatim as that text.
+// Global specifically, not the repository's effective value. This identity is written
+// into the harness's global configuration, where it labels every future session from
+// this machine — so reading a repository-local `user.email` would take the work address
+// configured in one checkout and stamp it on personal sessions in every other directory,
+// permanently and invisibly. A machine-wide file deserves a machine-wide answer;
+// `--identity` exists for anyone who wants a different one.
+//
+// The value is resolved here and written as a literal. It cannot be left as a shell
+// substitution: harness config files hold literal strings, so a
+// `$(git config user.email)` written into one is exported verbatim as that text.
 func GitEmail(ctx context.Context) string {
 	path, err := exec.LookPath("git")
 	if err != nil {
@@ -52,9 +59,11 @@ func GitEmail(ctx context.Context) string {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, path, "config", "--get", "user.email").Output()
+	out, err := exec.CommandContext(ctx, path, "config", "--global", "--get", "user.email").Output()
 	if err != nil {
-		// Unset is the ordinary case (exit 1), not a failure worth reporting.
+		// Unset is the ordinary case (exit 1), not a failure worth reporting. There is
+		// deliberately no fallback to the local value: being wrong about who a session
+		// belongs to is worse than not saying.
 		return ""
 	}
 	return strings.TrimSpace(string(out))

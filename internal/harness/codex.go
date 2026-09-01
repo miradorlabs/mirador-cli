@@ -24,7 +24,9 @@ func (Codex) Render(Exporter) map[string]string { return nil }
 
 func (c Codex) Status() (Status, error) { return Status{}, c.unsupported() }
 
-func (c Codex) Connect(map[string]string) error { return c.unsupported() }
+func (c Codex) ConflictsWith(string) ([]Conflict, error) { return nil, c.unsupported() }
+
+func (c Codex) Connect(map[string]string, bool) error { return c.unsupported() }
 
 func (c Codex) Disconnect() (int, error) { return 0, c.unsupported() }
 

@@ -57,9 +57,31 @@ const (
 	protocolHTTPProtobuf = "http/protobuf"
 )
 
+// perSignalOverrides are the variables that take precedence over the generic ones
+// Mirador writes. Claude Code resolves each signal's exporter from the per-signal value
+// when present, and *merges* the generic headers into it — so a stale
+// OTEL_EXPORTER_OTLP_TRACES_ENDPOINT pointing at another vendor keeps receiving that
+// signal's spans, now carrying Mirador's Authorization header. That is a live server key
+// handed to a third party, and nothing downstream would show it: `telemetry status` reads
+// the generic endpoint and would report Mirador.
+//
+// Mirador never writes these. They are detected before a connect and reported, and only
+// removed when the user explicitly asks — they are the user's settings.
+var perSignalOverrides = []struct {
+	endpoint, protocol, headers string
+	signal                      Signal
+}{
+	{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "OTEL_EXPORTER_OTLP_TRACES_HEADERS", SignalTraces},
+	{"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "OTEL_EXPORTER_OTLP_LOGS_HEADERS", SignalLogs},
+	{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "OTEL_EXPORTER_OTLP_METRICS_HEADERS", SignalMetrics},
+}
+
 // claudeManagedKeys is every variable Mirador sets, and therefore exactly what
 // disconnect removes. A key absent from this list would be orphaned in the user's
 // config forever; a key wrongly present would delete a setting Mirador never made.
+//
+// The per-signal overrides above are deliberately absent: Mirador does not set them, so
+// disconnect must not delete them.
 var claudeManagedKeys = []string{
 	claudeEnableTelemetry,
 	claudeEnhancedTelemetry,
@@ -226,12 +248,91 @@ func (c Claude) Status() (Status, error) {
 
 	status.KeyPrefix = maskKeyFromHeaders(s.env[otelHeaders])
 	status.ProjectID = resourceAttribute(s.env[otelResourceAttributes], AttrProjectID)
+
+	// Counted whether or not the harness reports as connected: a config with telemetry
+	// switched off but the key still present has managed keys to clean up, and that is
+	// precisely the state disconnect must not walk away from.
+	for _, key := range claudeManagedKeys {
+		if _, ok := s.env[key]; ok {
+			status.ManagedKeys++
+		}
+	}
+
+	// Compared against the endpoint actually configured here, so status reports whether
+	// this file is internally consistent — not whether it agrees with some other project.
+	status.Conflicts = claudeConflicts(s.env, status.Endpoint)
 	return status, nil
+}
+
+// ConflictsWith reports what in the existing config would defeat an export aimed at
+// endpoint: a generic endpoint already pointing elsewhere, or any per-signal override.
+func (c Claude) ConflictsWith(endpoint string) ([]Conflict, error) {
+	path, err := c.ConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	s, err := loadSettings(path)
+	if err != nil {
+		return nil, err
+	}
+	return claudeConflicts(s.env, endpoint), nil
+}
+
+// claudeConflicts finds every setting that would send data — and with it Mirador's
+// Authorization header — somewhere other than endpoint, or break the export outright.
+//
+// endpoint is the generic endpoint that will be in effect: the one about to be written
+// during a connect, or the one already on disk when reporting status.
+func claudeConflicts(env map[string]string, endpoint string) []Conflict {
+	var out []Conflict
+
+	// The generic endpoint pointing at another collector is not a leak on its own — it
+	// is overwritten — but it means a connect would silently replace a working export
+	// the user set up. Reported so that replacement is a decision, not an accident.
+	if current := env[otelEndpoint]; current != "" && current != endpoint && isOn(env[claudeEnableTelemetry]) {
+		out = append(out, Conflict{
+			Key:    otelEndpoint,
+			Value:  current,
+			Reason: "telemetry is already exporting here; connecting replaces it",
+		})
+	}
+
+	for _, o := range perSignalOverrides {
+		if v := env[o.endpoint]; v != "" && v != endpoint {
+			out = append(out, Conflict{
+				Key:   o.endpoint,
+				Value: v,
+				// This is the whole reason the check exists.
+				Reason:     "overrides the endpoint for " + string(o.signal) + ", which would receive Mirador's credential",
+				Credential: true,
+			})
+		}
+		if v := env[o.headers]; v != "" {
+			// The value is a header bag that may itself hold a credential, so it is
+			// named but never printed.
+			out = append(out, Conflict{
+				Key:    o.headers,
+				Reason: "merges into the headers for " + string(o.signal) + ", overriding Mirador's",
+			})
+		}
+		if v := env[o.protocol]; v != "" && v != protocolHTTPProtobuf {
+			out = append(out, Conflict{
+				Key:    o.protocol,
+				Value:  v,
+				Reason: "sends " + string(o.signal) + " over a protocol Mirador's endpoint does not serve",
+			})
+		}
+	}
+	return out
 }
 
 // Connect merges Mirador's variables into the settings file, leaving every other
 // setting — hooks, permissions, model, statusLine — untouched.
-func (c Claude) Connect(env map[string]string) error {
+//
+// clearConflicts removes the per-signal overrides reported by ConflictsWith. Without it
+// they are left alone, which is why the caller must refuse to connect while any remain:
+// writing the credential and leaving the override in place is the leak.
+func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 	path, err := c.ConfigPath()
 	if err != nil {
 		return err
@@ -240,6 +341,18 @@ func (c Claude) Connect(env map[string]string) error {
 	if err != nil {
 		return err
 	}
+
+	if clearConflicts {
+		for _, conflict := range claudeConflicts(s.env, env[otelEndpoint]) {
+			// The generic endpoint is about to be overwritten by the merge anyway;
+			// deleting it here would be a no-op with a confusing name.
+			if conflict.Key == otelEndpoint {
+				continue
+			}
+			delete(s.env, conflict.Key)
+		}
+	}
+
 	s.merge(env)
 	// tighten: the merged env carries the server key.
 	return s.save(true)
