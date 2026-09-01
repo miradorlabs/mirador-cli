@@ -34,6 +34,7 @@ type Profile struct {
 	APIURL           string `json:"api_url,omitempty"`
 	AuthURL          string `json:"auth_url,omitempty"`
 	AppURL           string `json:"app_url,omitempty"`
+	OTLPURL          string `json:"otlp_url,omitempty"`
 	OrganizationID   string `json:"organization_id,omitempty"`
 	OrganizationName string `json:"organization_name,omitempty"`
 	ProjectID        string `json:"project_id,omitempty"`
@@ -53,6 +54,9 @@ type Config struct {
 	APIURL  string
 	AuthURL string
 	AppURL  string
+	// OTLPURL is the telemetry ingest host written into an agent harness's config by
+	// `mirador telemetry connect`. The CLI itself never calls it.
+	OTLPURL string
 
 	OrganizationID   string
 	OrganizationName string
@@ -74,6 +78,7 @@ type Overrides struct {
 	APIURL    string
 	AuthURL   string
 	AppURL    string
+	OTLPURL   string
 	ProjectID string
 }
 
@@ -96,6 +101,7 @@ func Load(o Overrides) (*Config, error) {
 		APIURL:           strings.TrimRight(firstNonEmpty(o.APIURL, os.Getenv("MIRADOR_API_URL"), profile.APIURL, DefaultAPIURL), "/"),
 		AuthURL:          strings.TrimRight(firstNonEmpty(o.AuthURL, os.Getenv("MIRADOR_AUTH_URL"), profile.AuthURL, DefaultAuthURL), "/"),
 		AppURL:           strings.TrimRight(firstNonEmpty(o.AppURL, os.Getenv("MIRADOR_APP_URL"), profile.AppURL, DefaultAppURL), "/"),
+		OTLPURL:          strings.TrimRight(firstNonEmpty(o.OTLPURL, os.Getenv("MIRADOR_OTLP_URL"), profile.OTLPURL, DefaultOTLPURL), "/"),
 		OrganizationID:   firstNonEmpty(os.Getenv("MIRADOR_ORGANIZATION_ID"), profile.OrganizationID),
 		OrganizationName: profile.OrganizationName,
 		ProjectID:        firstNonEmpty(o.ProjectID, os.Getenv("MIRADOR_PROJECT_ID"), profile.ProjectID),
@@ -112,6 +118,10 @@ func Load(o Overrides) (*Config, error) {
 		{"api", cfg.APIURL},
 		{"auth", cfg.AuthURL},
 		{"app", cfg.AppURL},
+		// The CLI never calls the OTLP host, but it writes the URL into a harness's
+		// config alongside a server key. A cleartext endpoint there would put that key
+		// on the wire on every export, so it is held to the same standard.
+		{"otlp", cfg.OTLPURL},
 	} {
 		if err := validateEndpoint(endpoint.name, endpoint.value); err != nil {
 			return nil, err

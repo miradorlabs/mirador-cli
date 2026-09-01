@@ -17,6 +17,7 @@ type configView struct {
 	APIURL           string `json:"api_url"`
 	AuthURL          string `json:"auth_url"`
 	AppURL           string `json:"app_url"`
+	OTLPURL          string `json:"otlp_url"`
 	OrganizationID   string `json:"organization_id,omitempty"`
 	OrganizationName string `json:"organization_name,omitempty"`
 	ProjectID        string `json:"project_id,omitempty"`
@@ -70,6 +71,7 @@ func newConfigShowCommand() *cobra.Command {
 				APIURL:           cfg.APIURL,
 				AuthURL:          cfg.AuthURL,
 				AppURL:           cfg.AppURL,
+				OTLPURL:          cfg.OTLPURL,
 				OrganizationID:   cfg.OrganizationID,
 				OrganizationName: cfg.OrganizationName,
 				ProjectID:        cfg.ProjectID,
@@ -83,6 +85,7 @@ func newConfigShowCommand() *cobra.Command {
 				{"api url", cfg.APIURL},
 				{"auth url", cfg.AuthURL},
 				{"app url", cfg.AppURL},
+				{"otlp url", cfg.OTLPURL},
 				{"organization", displayOrg(cfg.OrganizationName, cfg.OrganizationID)},
 				{"project", displayOrg(cfg.ProjectName, cfg.ProjectID)},
 				{"auth", authMode},
@@ -151,7 +154,7 @@ func newConfigUseCommand() *cobra.Command {
 }
 
 func newConfigSetCommand() *cobra.Command {
-	var apiURL, authURL, appURL string
+	var apiURL, authURL, appURL, otlpURL string
 
 	cmd := &cobra.Command{
 		Use:   "set",
@@ -163,8 +166,8 @@ deployment. Combine with ` + "`mirador config use <name>`" + ` to keep one profi
 deployment and switch between them.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if apiURL == "" && authURL == "" && appURL == "" {
-				return fmt.Errorf("nothing to set — pass --api-url, --auth-url, or --app-url")
+			if apiURL == "" && authURL == "" && appURL == "" && otlpURL == "" {
+				return fmt.Errorf("nothing to set — pass --api-url, --auth-url, --app-url, or --otlp-url")
 			}
 			cfg, err := loadConfig()
 			if err != nil {
@@ -180,6 +183,9 @@ deployment and switch between them.`,
 				if appURL != "" {
 					p.AppURL = appURL
 				}
+				if otlpURL != "" {
+					p.OTLPURL = otlpURL
+				}
 			}); err != nil {
 				return err
 			}
@@ -191,5 +197,6 @@ deployment and switch between them.`,
 	cmd.Flags().StringVar(&apiURL, "api-url", "", "Mirador data API base URL")
 	cmd.Flags().StringVar(&authURL, "auth-url", "", "Mirador auth API base URL")
 	cmd.Flags().StringVar(&appURL, "app-url", "", "Mirador app base URL")
+	cmd.Flags().StringVar(&otlpURL, "otlp-url", "", "Mirador OTLP ingest URL (written into harness configs by `telemetry connect`)")
 	return cmd
 }

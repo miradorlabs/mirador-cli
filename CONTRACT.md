@@ -12,6 +12,10 @@ it.
 | `auth.mirador.org` | Credential lifecycle, and the org/project listings a fresh credential needs | `gateways/auth` |
 | `api.mirador.org` | Traces, logs, metrics, dashboards | `gateways/api` |
 
+A third host, `otel.mirador.org` (`gateways/otel`), ingests OTLP. The CLI never calls it;
+`mirador telemetry connect` writes its URL, plus a minted server key, into an agent
+harness's own configuration, and the harness exports there directly.
+
 They are separate because the credential surface has properties nothing else shares: it is the only
 unauthenticated write, the only credential-minting endpoint, and the highest-value attack target.
 Its own host means its own edge policy, its own rate limits, and its own blast radius.
@@ -134,6 +138,36 @@ own project, so the command still works under `MIRADOR_API_KEY`.
 ```json
 { "projects": [ { "id": "…", "name": "…", "organization_id": "…", "created_at": "…" } ] }
 ```
+
+### `POST /v1/api-keys/server` — CLI-token auth
+
+Mints a `mir_srv_*` key bound to one project. `mirador telemetry connect` calls this to
+provision the credential it writes into an agent harness's configuration.
+
+```json
+{ "project_id": "…", "name": "claude-code@laptop", "description": "…" }
+```
+
+201, with `Cache-Control: no-store`:
+
+```json
+{
+  "key": "mir_srv_…",
+  "server_key": { "id": "…", "project_id": "…", "name": "…", "key_prefix": "mir_srv_a1b2…" }
+}
+```
+
+`key` is the plaintext, returned exactly once — the server stores only a hash.
+
+**A server key cannot call this.** It is 403 under `mir_srv_`, for two reasons: a key
+that could mint successors would survive its own revocation, turning a bounded
+compromise into a permanent one; and the account API records `created_by`, which a key
+has no user identity to supply. The organization is taken from the credential, never
+from the body.
+
+A `project_id` naming an unknown project — or one in another organization — is 400, not
+404. Distinguishing them would make the status code an oracle for enumerating projects
+across tenants.
 
 ### `GET /v1/organizations` — CLI-token auth
 
