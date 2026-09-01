@@ -274,14 +274,11 @@ func (c Claude) Status() (Status, error) {
 	// With a journal, ownership is value-based: a key edited since connect is the user's
 	// and must not make a later disconnect fall back to deleting it. Without a journal,
 	// retain the legacy name-based count so older installations can still be cleaned up.
-	j, err := loadJournal(c.Name())
+	j, err := loadJournal(c.Name(), path)
 	if err != nil {
 		return Status{}, err
 	}
 	if j != nil {
-		if j.ConfigPath != path {
-			return Status{}, fmt.Errorf("telemetry journal belongs to %s, not %s", j.ConfigPath, path)
-		}
 		for key, installed := range j.Installed {
 			if current, ok := s.env[key]; ok && current == installed {
 				status.ManagedKeys++
@@ -311,18 +308,6 @@ func (c Claude) ConflictsWith(e Exporter) ([]Conflict, error) {
 	path, err := c.ConfigPath()
 	if err != nil {
 		return nil, err
-	}
-	j, err := loadJournal(c.Name())
-	if err != nil {
-		return nil, err
-	}
-	if j != nil && j.ConfigPath != path {
-		// This runs before key minting. Refuse here rather than later in Connect, where
-		// discovering the single harness journal belongs to another config would strand a
-		// freshly created server key.
-		return nil, fmt.Errorf(
-			"telemetry journal belongs to %s, not %s — disconnect that configuration before connecting this one",
-			j.ConfigPath, path)
 	}
 	s, err := loadSettings(path)
 	if err != nil {
@@ -467,14 +452,9 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 	if err != nil {
 		return err
 	}
-	previousJournal, err := loadJournal(c.Name())
+	previousJournal, err := loadJournal(c.Name(), path)
 	if err != nil {
 		return err
-	}
-	if previousJournal != nil && previousJournal.ConfigPath != path {
-		return fmt.Errorf(
-			"telemetry journal belongs to %s, not %s — disconnect that configuration before connecting this one",
-			previousJournal.ConfigPath, path)
 	}
 
 	cleared := map[string]string{}
@@ -531,7 +511,7 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 		if previousJournal != nil {
 			rollbackErr = previousJournal.save()
 		} else {
-			rollbackErr = deleteJournal(c.Name())
+			rollbackErr = deleteJournal(c.Name(), path)
 		}
 		if rollbackErr != nil {
 			return fmt.Errorf("write settings: %w (also failed to restore telemetry journal: %v)", err, rollbackErr)
@@ -558,7 +538,7 @@ func (c Claude) Disconnect() (DisconnectResult, error) {
 		return DisconnectResult{}, err
 	}
 
-	j, err := loadJournal(c.Name())
+	j, err := loadJournal(c.Name(), path)
 	if err != nil {
 		return DisconnectResult{}, err
 	}
@@ -566,7 +546,9 @@ func (c Claude) Disconnect() (DisconnectResult, error) {
 	var result DisconnectResult
 	var remaining *journal
 	switch {
-	case j != nil && j.ConfigPath == path:
+	// loadJournal only returns a record written for this exact config, so a non-nil
+	// journal is by construction the right one.
+	case j != nil:
 		result, remaining = j.apply(s.env)
 		for key, value := range j.ClearedSettings {
 			if _, taken := s.root[key]; taken {
@@ -581,12 +563,8 @@ func (c Claude) Disconnect() (DisconnectResult, error) {
 			s.root[key] = encoded
 			result.Restored++
 		}
-	case j != nil:
-		return DisconnectResult{}, fmt.Errorf(
-			"telemetry journal belongs to %s, not %s — refusing an unjournaled removal",
-			j.ConfigPath, path)
 	default:
-		// No record, or one written against a different config file.
+		// No record: an older connect, or a hand-edited config.
 		result.Removed = s.remove(claudeManagedKeys)
 		result.Unjournaled = true
 	}
@@ -605,7 +583,7 @@ func (c Claude) Disconnect() (DisconnectResult, error) {
 	if remaining != nil && !remaining.empty() {
 		return result, remaining.save()
 	}
-	return result, deleteJournal(c.Name())
+	return result, deleteJournal(c.Name(), path)
 }
 
 // exporterFromEnv reconstructs the shape of a rendered env map, so code holding only
@@ -654,11 +632,11 @@ func (c Claude) Backup(endpoint string) (string, error) {
 
 	// A journal for this exact file means the current contents are Mirador's own work,
 	// so the stored backup is still the pre-Mirador state and must be kept.
-	j, err := loadJournal(c.Name())
+	j, err := loadJournal(c.Name(), path)
 	if err != nil {
 		return "", err
 	}
-	if j != nil && j.ConfigPath == path {
+	if j != nil {
 		return s.backup(false)
 	}
 	// No record: fall back to the endpoint, which is the only evidence there is.

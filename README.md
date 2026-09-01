@@ -236,7 +236,7 @@ Claude Code found: 2.1.220
 Connect Claude Code to Mirador? [Y/n] y
 
 Connected. Restart Claude Code, then run a prompt.
-View traces with: mirador trace list --filter 'service.name="claude-code"'
+View traces with: mirador trace list --filter 'attribute.service.name="claude-code"'
 ```
 
 ### What gets sent

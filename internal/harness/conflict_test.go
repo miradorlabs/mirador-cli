@@ -685,7 +685,7 @@ func TestDisconnectRefusesCorruptJournal(t *testing.T) {
 	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	journalFile, err := journalPath(c.Name())
+	journalFile, err := journalPath(c.Name(), path)
 	if err != nil {
 		t.Fatalf("journalPath: %v", err)
 	}
@@ -925,5 +925,70 @@ func TestConflictsIgnoreDormantBetaTracing(t *testing.T) {
 	}
 	if len(conflicts) != 0 {
 		t.Fatalf("got %+v, want none — ENABLE_BETA_TRACING_DETAILED is not set", conflicts)
+	}
+}
+
+// Connecting a sandbox under CLAUDE_CONFIG_DIR must not disturb a different config's
+// record. A single per-harness journal made these collide: the sandbox connect
+// overwrote the record for the real ~/.claude, and every later read of the real config
+// found a journal describing a file it was never asked about.
+func TestJournalIsPerConfigNotPerHarness(t *testing.T) {
+	miradorHome := t.TempDir()
+	t.Setenv("MIRADOR_CONFIG_DIR", miradorHome)
+
+	realDir := t.TempDir()
+	sandboxDir := t.TempDir()
+	c := Claude{}
+
+	// Connect the "real" config.
+	t.Setenv("CLAUDE_CONFIG_DIR", realDir)
+	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+		t.Fatalf("connect real: %v", err)
+	}
+
+	// Connect a sandbox, as anyone testing this would.
+	t.Setenv("CLAUDE_CONFIG_DIR", sandboxDir)
+	sandbox := fullExporter()
+	sandbox.Endpoint = "https://otel-dev.mirador.org"
+	if err := c.Connect(c.Render(sandbox), false); err != nil {
+		t.Fatalf("connect sandbox: %v", err)
+	}
+
+	// The real config must still read cleanly, and still be connected.
+	t.Setenv("CLAUDE_CONFIG_DIR", realDir)
+	st, err := c.Status()
+	if err != nil {
+		t.Fatalf("Status on the real config after a sandbox connect: %v", err)
+	}
+	if !st.Connected {
+		t.Fatal("the real config stopped reporting as connected")
+	}
+	if st.Endpoint != miradorEndpoint {
+		t.Errorf("real endpoint = %q, want it untouched by the sandbox connect", st.Endpoint)
+	}
+
+	// And each disconnects independently, restoring its own file.
+	realResult, err := c.Disconnect()
+	if err != nil {
+		t.Fatalf("disconnect real: %v", err)
+	}
+	if realResult.Unjournaled {
+		t.Error("the real config lost its ownership record to the sandbox connect")
+	}
+
+	t.Setenv("CLAUDE_CONFIG_DIR", sandboxDir)
+	sandboxStatus, err := c.Status()
+	if err != nil {
+		t.Fatalf("Status on the sandbox after the real disconnect: %v", err)
+	}
+	if !sandboxStatus.Connected {
+		t.Fatal("disconnecting the real config also disconnected the sandbox")
+	}
+	sandboxResult, err := c.Disconnect()
+	if err != nil {
+		t.Fatalf("disconnect sandbox: %v", err)
+	}
+	if sandboxResult.Unjournaled {
+		t.Error("the sandbox lost its own ownership record")
 	}
 }

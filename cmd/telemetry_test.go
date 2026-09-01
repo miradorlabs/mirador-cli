@@ -352,3 +352,34 @@ func TestTelemetryDisconnectCleansPartiallyDisabledConfig(t *testing.T) {
 		t.Errorf("disconnect removed an unrelated setting:\n%s", data)
 	}
 }
+
+// The success message hands the user a command to run, so it has to be a command that
+// works. The trace filter grammar accepts status, severity, tag and attribute.<key>; a
+// bare `service.name` is rejected as an undeclared identifier, which is what the first
+// version of this message printed.
+func TestTelemetryConnectPrintsAUsableFilter(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+
+	var out bytes.Buffer
+	root := NewRootCommand()
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"telemetry", "connect", "claude",
+		"--api-key", "mir_srv_test",
+		"--project", "770e8400-e29b-41d4-a716-446655440000",
+		"--yes",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, `--filter 'attribute.service.name="claude-code"'`) {
+		t.Errorf("connect did not print a usable trace filter:\n%s", got)
+	}
+	if strings.Contains(got, `--filter 'service.name=`) {
+		t.Error("connect printed a bare service.name filter, which the trace grammar rejects")
+	}
+}

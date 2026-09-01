@@ -192,7 +192,12 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 	}
 
 	fmt.Fprintf(out, "\nConnected. Restart %s, then run a prompt.\n", h.DisplayName())
-	fmt.Fprintf(out, "View traces with: mirador trace list --filter 'service.name=\"%s\"'\n", harness.ServiceName(h))
+	// attribute.<key>, not a bare key: the trace filter grammar accepts status, severity,
+	// tag and attribute.<key>, and a bare `service.name` is rejected as an undeclared
+	// identifier. service.name arrives as a resource attribute, which the ingest pipeline
+	// promotes onto the trace, so it is reachable under the attribute. prefix.
+	fmt.Fprintf(out, "View traces with: mirador trace list --filter 'attribute.service.name=\"%s\"'\n",
+		harness.ServiceName(h))
 	return nil
 }
 

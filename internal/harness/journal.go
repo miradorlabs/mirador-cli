@@ -1,6 +1,8 @@
 package harness
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,18 +47,33 @@ type journal struct {
 	ClearedSettings map[string]string `json:"cleared_settings,omitempty"`
 }
 
-func journalPath(harness string) (string, error) {
+// journalPath keys the record by the config file it describes, not by the harness alone.
+//
+// One harness can be connected in more than one place — a sandbox under CLAUDE_CONFIG_DIR
+// alongside the real ~/.claude, which is exactly how anyone tests this. A single
+// per-harness record makes those two collide: connecting the sandbox overwrites the
+// record for the real config, and every later read finds a journal describing a file it
+// was not asked about. Each config gets its own record instead, so the two are simply
+// independent.
+//
+// The path is hashed rather than embedded because it is an absolute filesystem path:
+// too long, and full of separators. The basename keeps the harness name so the directory
+// stays readable, and ConfigPath inside the file remains the authoritative answer to
+// "which config is this?".
+func journalPath(harness, configPath string) (string, error) {
 	dir, err := config.Dir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "telemetry", harness+".json"), nil
+	sum := sha256.Sum256([]byte(configPath))
+	name := fmt.Sprintf("%s-%s.json", harness, hex.EncodeToString(sum[:])[:12])
+	return filepath.Join(dir, "telemetry", name), nil
 }
 
 // loadJournal returns nil when there is no record, which is not an error: a config
 // connected by an older build, or edited by hand, simply has none.
-func loadJournal(harness string) (*journal, error) {
-	path, err := journalPath(harness)
+func loadJournal(harness, configPath string) (*journal, error) {
+	path, err := journalPath(harness, configPath)
 	if err != nil {
 		return nil, err
 	}
@@ -75,6 +92,11 @@ func loadJournal(harness string) (*journal, error) {
 		// disconnect delete values that a user changed after connecting.
 		return nil, fmt.Errorf("parse %s: %w (repair or remove it explicitly, then retry)", path, err)
 	}
+	if j.ConfigPath != configPath {
+		// A hash collision, or a file moved by hand. Not this config's record, so it is
+		// as good as absent rather than an error about someone else's file.
+		return nil, nil
+	}
 	if j.Harness != harness || j.ConfigPath == "" || j.Installed == nil || j.Previous == nil {
 		return nil, fmt.Errorf("parse %s: incomplete telemetry journal (repair or remove it explicitly, then retry)", path)
 	}
@@ -87,7 +109,7 @@ func loadJournal(harness string) (*journal, error) {
 }
 
 func (j *journal) save() error {
-	path, err := journalPath(j.Harness)
+	path, err := journalPath(j.Harness, j.ConfigPath)
 	if err != nil {
 		return err
 	}
@@ -102,8 +124,8 @@ func (j *journal) save() error {
 	return writeFileAtomic(path, append(data, '\n'), settingsMode)
 }
 
-func deleteJournal(harness string) error {
-	path, err := journalPath(harness)
+func deleteJournal(harness, configPath string) error {
+	path, err := journalPath(harness, configPath)
 	if err != nil {
 		return err
 	}
