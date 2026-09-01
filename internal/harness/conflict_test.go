@@ -383,7 +383,7 @@ func TestConnectWritesThroughASymlink(t *testing.T) {
 	dir := t.TempDir()
 	realDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
-	t.Setenv("MIRADOR_CONFIG_DIR", filepath.Join(dir, "mirador"))
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
 
 	target := filepath.Join(realDir, "settings.json")
 	if err := os.WriteFile(target, []byte(`{"model":"opus"}`), 0o600); err != nil {
@@ -719,7 +719,7 @@ func TestConnectRefusesADanglingSymlink(t *testing.T) {
 	}
 	dir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
-	t.Setenv("MIRADOR_CONFIG_DIR", filepath.Join(dir, "mirador"))
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
 
 	link := filepath.Join(dir, "settings.json")
 	missing := filepath.Join(t.TempDir(), "not-checked-out", "settings.json")
@@ -756,7 +756,7 @@ func TestDisconnectKeepsASymlinkTargetAlive(t *testing.T) {
 	dir := t.TempDir()
 	realDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
-	t.Setenv("MIRADOR_CONFIG_DIR", filepath.Join(dir, "mirador"))
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
 
 	target := filepath.Join(realDir, "settings.json")
 	if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
