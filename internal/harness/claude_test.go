@@ -468,7 +468,7 @@ func TestBackupCopiesTheOriginal(t *testing.T) {
 	const original = `{"model":"opus"}`
 	c, path := claudeIn(t, original)
 
-	backup, err := c.Backup()
+	backup, err := c.Backup(miradorEndpoint)
 	if err != nil {
 		t.Fatalf("Backup: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestBackupCopiesTheOriginal(t *testing.T) {
 func TestBackupIsSkippedWhenThereIsNoFile(t *testing.T) {
 	c, _ := claudeIn(t, "")
 
-	backup, err := c.Backup()
+	backup, err := c.Backup(miradorEndpoint)
 	if err != nil {
 		t.Fatalf("Backup: %v", err)
 	}

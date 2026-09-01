@@ -31,6 +31,10 @@ type settingsFile struct {
 	// existed distinguishes "no telemetry configured" from "no file at all", which
 	// status reports differently.
 	existed bool
+	// symlinked records that path is a link. A disconnect that empties the document
+	// deletes the file — but deleting the *target* of a link leaves the link dangling,
+	// so a linked file is emptied to `{}` instead.
+	symlinked bool
 	// mode is the file's mode as found, so a file that was already tighter than 0600
 	// is not loosened by writing it back.
 	mode fs.FileMode
@@ -55,9 +59,26 @@ func loadSettings(path string) (*settingsFile, error) {
 		mode:      settingsMode,
 	}
 
-	// A missing file, or a dangling link, resolves to nothing — keep the original name
-	// so a first connect creates it where it was asked to.
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+	// A symlink is resolved so the write lands on the real file and the link survives.
+	// A *dangling* link is refused rather than followed: writing to the link path would
+	// replace it with a regular file, silently detaching a dotfiles setup from its repo,
+	// and there is no safe way to guess where the missing target was meant to live.
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		s.symlinked = true
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			target, readErr := os.Readlink(path)
+			if readErr != nil {
+				target = "its target"
+			}
+			return nil, fmt.Errorf(
+				"%s is a symlink to %s, which does not exist — restore it or replace the link, then retry",
+				path, target)
+		}
+		s.writePath = resolved
+	} else if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		// Not a link itself, but a parent directory may be one; resolve so the atomic
+		// rename happens in the directory the file actually lives in.
 		s.writePath = resolved
 	}
 
@@ -133,8 +154,11 @@ func (s *settingsFile) save(tighten bool) error {
 		s.root[envKey] = encoded
 	}
 
-	// A document with nothing left in it is removed rather than written as `{}`.
-	if len(s.root) == 0 {
+	// A document with nothing left in it is removed rather than written as `{}` — unless
+	// it is reached through a symlink, where removing the target would leave the link
+	// dangling and break the next read. There, an empty object is written instead: it
+	// says the same thing and keeps the file the link points at.
+	if len(s.root) == 0 && !s.symlinked {
 		if !s.existed {
 			return nil
 		}
@@ -165,22 +189,29 @@ func (s *settingsFile) save(tighten bool) error {
 // is a user's own configuration, possibly hand-written and possibly in a dotfiles repo;
 // a mangled merge should never be the only copy left.
 //
-// An existing backup is never overwritten. It is the pre-Mirador configuration, and it
-// is the only record of it: connect overwrites the telemetry variables and disconnect
-// deletes them, neither remembering what was there before. Overwriting on a re-connect
-// would replace that record with a copy of Mirador's own settings, so the second connect
-// would be what destroys the original — not the first.
+// replace decides whether an existing backup may be overwritten, and the caller sets it
+// from whether the current file is Mirador's own work.
+//
+// Neither "always" nor "never" is right. Always overwriting means a re-connect replaces
+// the record of the user's original collector with a copy of Mirador's settings. Never
+// overwriting means the record goes stale the moment the user reconfigures: connect,
+// disconnect, set up a different collector, re-connect — the backup still holds the
+// first configuration while the second is overwritten and then deleted, unrecoverable.
+// So the rule is to snapshot whatever is not already Mirador's, and leave the snapshot
+// alone when re-connecting over a config this CLI wrote.
 //
 // Best-effort by design: a failure to write the backup must not block the connect the
 // user asked for, so the caller reports it as a warning.
-func (s *settingsFile) backup() (string, error) {
+func (s *settingsFile) backup(replace bool) (string, error) {
 	if !s.existed {
 		return "", nil
 	}
 	// Alongside the real file, not the link that points at it.
 	path := s.writePath + ".mirador.bak"
 	if _, err := os.Stat(path); err == nil {
-		return path, nil
+		if !replace {
+			return path, nil
+		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return "", err
 	}

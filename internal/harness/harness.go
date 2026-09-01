@@ -96,6 +96,21 @@ func (e Exporter) HasSignal(s Signal) bool {
 	return slices.Contains(e.Signals, s)
 }
 
+// SignalEndpoint is the full URL a per-signal OTLP variable must carry to reach the
+// same place the generic endpoint does.
+//
+// The OTLP spec makes these two different: an exporter appends `v1/traces` (and so on)
+// to OTEL_EXPORTER_OTLP_ENDPOINT, but a per-signal OTEL_EXPORTER_OTLP_<signal>_ENDPOINT
+// "MUST be used as-is without any modification". So a per-signal variable holding the
+// bare base URL is not equivalent to the generic one — it posts to the wrong path — and
+// only the value below is actually safe.
+func (e Exporter) SignalEndpoint(s Signal) string {
+	if e.Endpoint == "" {
+		return ""
+	}
+	return strings.TrimRight(e.Endpoint, "/") + "/v1/" + string(s)
+}
+
 // ResourceAttributesValue renders OTEL_RESOURCE_ATTRIBUTES. Keys are sorted so the
 // value is byte-stable across runs — an unstable ordering would make every connect
 // look like a change to the config file.
@@ -201,10 +216,14 @@ type Harness interface {
 	Status() (Status, error)
 
 	// ConflictsWith reports settings already in the config that would override or
-	// redirect an export aimed at endpoint. Called before Connect writes anything,
-	// because the dangerous case — a per-signal endpoint inheriting Mirador's
-	// Authorization header — is invisible once the credential is on disk.
-	ConflictsWith(endpoint string) ([]Conflict, error)
+	// redirect the export e describes. Called before Connect writes anything, because
+	// the dangerous case — a per-signal endpoint inheriting Mirador's Authorization
+	// header — is invisible once the credential is on disk.
+	//
+	// It takes the whole Exporter rather than just an endpoint because whether a setting
+	// conflicts depends on which signals are enabled: a redirect that only moves traces
+	// is irrelevant to a metrics-only connect.
+	ConflictsWith(e Exporter) ([]Conflict, error)
 
 	// Connect merges env into the config, preserving every setting it does not own.
 	// Conflicting overrides are removed only when clearConflicts is set, which the

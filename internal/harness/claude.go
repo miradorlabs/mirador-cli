@@ -55,6 +55,18 @@ const (
 	// proxies and corporate TLS interception, which the gRPC transport frequently
 	// does not.
 	protocolHTTPProtobuf = "http/protobuf"
+
+	// The detailed-beta-tracing pair. Together these send logs and traces to
+	// BETA_TRACING_ENDPOINT *instead of* through the configured exporters — a redirect
+	// that bypasses OTEL_EXPORTER_OTLP_ENDPOINT entirely, so checking only the OTLP
+	// variables would miss it.
+	//
+	// Anthropic treats this as part of the same boundary: managed settings that pin an
+	// endpoint or credential strip a developer-set BETA_TRACING_ENDPOINT. Mirador writes
+	// user settings, not managed settings, so it gets none of that protection and has to
+	// do the check itself.
+	claudeBetaTracingDetailed = "ENABLE_BETA_TRACING_DETAILED"
+	claudeBetaTracingEndpoint = "BETA_TRACING_ENDPOINT"
 )
 
 // perSignalOverrides are the variables that take precedence over the generic ones
@@ -260,13 +272,17 @@ func (c Claude) Status() (Status, error) {
 
 	// Compared against the endpoint actually configured here, so status reports whether
 	// this file is internally consistent — not whether it agrees with some other project.
-	status.Conflicts = claudeConflicts(s.env, status.Endpoint)
+	status.Conflicts = claudeConflicts(s.env, Exporter{
+		Endpoint: status.Endpoint,
+		Signals:  status.Signals,
+	})
 	return status, nil
 }
 
-// ConflictsWith reports what in the existing config would defeat an export aimed at
-// endpoint: a generic endpoint already pointing elsewhere, or any per-signal override.
-func (c Claude) ConflictsWith(endpoint string) ([]Conflict, error) {
+// ConflictsWith reports what in the existing config would defeat the export e describes:
+// a generic endpoint already pointing elsewhere, a per-signal override, or the
+// detailed-beta-tracing redirect.
+func (c Claude) ConflictsWith(e Exporter) ([]Conflict, error) {
 	path, err := c.ConfigPath()
 	if err != nil {
 		return nil, err
@@ -275,36 +291,48 @@ func (c Claude) ConflictsWith(endpoint string) ([]Conflict, error) {
 	if err != nil {
 		return nil, err
 	}
-	return claudeConflicts(s.env, endpoint), nil
+	return claudeConflicts(s.env, e), nil
 }
 
 // claudeConflicts finds every setting that would send data — and with it Mirador's
-// Authorization header — somewhere other than endpoint, or break the export outright.
+// Authorization header — somewhere other than e.Endpoint, or break the export outright.
 //
-// endpoint is the generic endpoint that will be in effect: the one about to be written
-// during a connect, or the one already on disk when reporting status.
-func claudeConflicts(env map[string]string, endpoint string) []Conflict {
+// e describes the export that will be in effect: the one about to be written during a
+// connect, or the one already on disk when reporting status.
+func claudeConflicts(env map[string]string, e Exporter) []Conflict {
 	var out []Conflict
 
-	// The generic endpoint pointing at another collector is not a leak on its own — it
-	// is overwritten — but it means a connect would silently replace a working export
-	// the user set up. Reported so that replacement is a decision, not an accident.
-	if current := env[otelEndpoint]; current != "" && current != endpoint && isOn(env[claudeEnableTelemetry]) {
-		out = append(out, Conflict{
-			Key:    otelEndpoint,
-			Value:  current,
-			Reason: "telemetry is already exporting here; connecting replaces it",
-		})
+	// The generic endpoint pointing at another collector is not a disclosure — it is
+	// overwritten — but a connect would replace an export the user set up. Reported
+	// whether or not telemetry is currently switched on: a disabled config still holds
+	// the destination someone chose, and connect would overwrite it just the same.
+	if current := env[otelEndpoint]; current != "" && current != e.Endpoint {
+		reason := "telemetry is already exporting here; connecting replaces it"
+		if !isOn(env[claudeEnableTelemetry]) {
+			reason = "a previously configured destination; connecting replaces it"
+		}
+		out = append(out, Conflict{Key: otelEndpoint, Value: current, Reason: reason})
 	}
 
 	for _, o := range perSignalOverrides {
-		if v := env[o.endpoint]; v != "" && v != endpoint {
+		// A signal Mirador is not exporting cannot be redirected away from Mirador.
+		if !e.HasSignal(o.signal) {
+			continue
+		}
+		// Compared against the per-signal URL, not the base. The generic endpoint gets
+		// `/v1/<signal>` appended; a per-signal variable does not, so the bare base URL
+		// here posts to the wrong path and the suffixed URL is the only correct value.
+		if v := env[o.endpoint]; v != "" && v != e.SignalEndpoint(o.signal) {
+			reason := "overrides the endpoint for " + string(o.signal) + ", which would receive Mirador's credential"
+			if v == e.Endpoint {
+				reason = "is Mirador's base URL, which a per-signal endpoint does not append /v1/" +
+					string(o.signal) + " to — " + string(o.signal) + " would post to the wrong path"
+			}
 			out = append(out, Conflict{
-				Key:   o.endpoint,
-				Value: v,
-				// This is the whole reason the check exists.
-				Reason:     "overrides the endpoint for " + string(o.signal) + ", which would receive Mirador's credential",
-				Credential: true,
+				Key:        o.endpoint,
+				Value:      v,
+				Reason:     reason,
+				Credential: v != e.Endpoint,
 			})
 		}
 		if v := env[o.headers]; v != "" {
@@ -322,6 +350,22 @@ func claudeConflicts(env map[string]string, endpoint string) []Conflict {
 				Reason: "sends " + string(o.signal) + " over a protocol Mirador's endpoint does not serve",
 			})
 		}
+	}
+
+	// Detailed beta tracing diverts logs and traces to its own endpoint instead of the
+	// exporters, so it defeats the connect without touching a single OTEL_* variable.
+	// Only logs and traces move; a metrics-only connect is unaffected.
+	if endpoint := env[claudeBetaTracingEndpoint]; endpoint != "" &&
+		(e.HasSignal(SignalTraces) || e.HasSignal(SignalLogs)) {
+		out = append(out, Conflict{
+			Key:    claudeBetaTracingEndpoint,
+			Value:  endpoint,
+			Reason: "detailed beta tracing sends logs and traces here instead of to Mirador",
+			// Whether this carries OTEL_EXPORTER_OTLP_HEADERS is undocumented. Assumed
+			// yes: the safe assumption for a redirect is that the credential follows it,
+			// and Anthropic's managed settings strip this variable alongside credentials.
+			Credential: true,
+		})
 	}
 	return out
 }
@@ -343,13 +387,18 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 	}
 
 	if clearConflicts {
-		for _, conflict := range claudeConflicts(s.env, env[otelEndpoint]) {
+		for _, conflict := range claudeConflicts(s.env, exporterFromEnv(env)) {
 			// The generic endpoint is about to be overwritten by the merge anyway;
 			// deleting it here would be a no-op with a confusing name.
 			if conflict.Key == otelEndpoint {
 				continue
 			}
 			delete(s.env, conflict.Key)
+			// The beta-tracing switch and its endpoint are a pair — the switch alone
+			// does nothing, so leaving it behind would just be dead config.
+			if conflict.Key == claudeBetaTracingEndpoint {
+				delete(s.env, claudeBetaTracingDetailed)
+			}
 		}
 	}
 
@@ -376,8 +425,34 @@ func (c Claude) Disconnect() (int, error) {
 	return removed, s.save(false)
 }
 
+// exporterFromEnv reconstructs the shape of a rendered env map, so code holding only
+// the map can still ask which signals it turns on.
+func exporterFromEnv(env map[string]string) Exporter {
+	e := Exporter{Endpoint: env[otelEndpoint]}
+	for _, pair := range []struct {
+		key    string
+		signal Signal
+	}{
+		{otelTracesExporter, SignalTraces},
+		{otelLogsExporter, SignalLogs},
+		{otelMetricsExporter, SignalMetrics},
+	} {
+		if env[pair.key] == exporterOTLP {
+			e.Signals = append(e.Signals, pair.signal)
+		}
+	}
+	return e
+}
+
 // Backup exposes the pre-modification copy so `connect` can tell the user where it is.
-func (c Claude) Backup() (string, error) {
+//
+// endpoint is Mirador's own, and decides whether the existing file is worth snapshotting:
+// a config already pointing at Mirador is one this CLI wrote, so the stored backup is
+// still the pre-Mirador state and must be kept. A config pointing anywhere else is the
+// user's, and is what the backup should hold — including after a disconnect-and-
+// reconfigure cycle, where a never-overwritten backup would otherwise go stale and the
+// next disconnect would delete the only live copy.
+func (c Claude) Backup(endpoint string) (string, error) {
 	path, err := c.ConfigPath()
 	if err != nil {
 		return "", err
@@ -386,7 +461,7 @@ func (c Claude) Backup() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return s.backup()
+	return s.backup(s.env[otelEndpoint] != endpoint)
 }
 
 // ManagedKeys is what Disconnect would remove, for a preview.

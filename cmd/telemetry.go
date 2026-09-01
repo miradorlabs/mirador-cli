@@ -119,11 +119,19 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 	out := cmd.OutOrStdout()
 	detection := h.Detect(ctx)
 
-	// Before anything is minted or written. A per-signal endpoint left in place would
-	// keep exporting to whoever owns it while inheriting the Authorization header Mirador
-	// is about to write for the generic endpoint — handing out a live server key. Once
-	// the key is on disk that is invisible, so it has to be caught here.
-	conflicts, err := h.ConflictsWith(cfg.OTLPURL)
+	// The exporter this connect intends to install. Built before the key exists so the
+	// conflict check can run first: a per-signal endpoint or a beta-tracing redirect left
+	// in place would keep exporting to whoever owns it while inheriting the Authorization
+	// header Mirador is about to write — handing out a live server key. Once the key is
+	// on disk that is invisible, so it has to be caught here.
+	intended := harness.Exporter{
+		Endpoint:           cfg.OTLPURL,
+		Signals:            signals,
+		ResourceAttributes: resourceAttributes(ctx, h, cfg, f.identity),
+		IncludePrompts:     f.includePrompts,
+		IncludeToolContent: f.includeToolContent,
+	}
+	conflicts, err := h.ConflictsWith(intended)
 	if err != nil {
 		return err
 	}
@@ -148,31 +156,25 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 		}
 	}
 
-	key, keyMeta, err := resolveKey(ctx, cfg, h, f)
+	key, keyMeta, minted, err := resolveKey(ctx, cfg, h, f)
 	if err != nil {
 		return err
 	}
 
 	// Back up before the merge. Best-effort: a user who asked to connect should not be
 	// blocked because a backup could not be written, but they should hear about it.
-	if backup, err := backupHarnessConfig(h); err != nil {
+	if backup, err := backupHarnessConfig(h, cfg.OTLPURL); err != nil {
 		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not back up %s (%v).\n", configPath, err)
 	} else if backup != "" {
 		fmt.Fprintf(out, "\nBacked up %s\n", backup)
 	}
 
-	env := h.Render(harness.Exporter{
-		Endpoint:           cfg.OTLPURL,
-		APIKey:             key,
-		Signals:            signals,
-		ResourceAttributes: resourceAttributes(ctx, h, cfg, f.identity),
-		IncludePrompts:     f.includePrompts,
-		IncludeToolContent: f.includeToolContent,
-	})
-	if err := h.Connect(env, f.force); err != nil {
-		// The key was already minted at this point. Say so, so it can be revoked rather
-		// than left live and unaccounted for in the web app's key list.
-		if keyMeta.KeyPrefix != "" {
+	intended.APIKey = key
+	if err := h.Connect(h.Render(intended), f.force); err != nil {
+		// Only when this invocation created it. A key supplied with --api-key already
+		// existed and is still perfectly good, so telling the user to go revoke it would
+		// send them to destroy a working credential over an unrelated write failure.
+		if minted {
 			fmt.Fprintf(cmd.ErrOrStderr(),
 				"\nA key (%s) was minted before this failed. Revoke it in the web app if you do not retry.\n",
 				keyMeta.KeyPrefix)
@@ -233,13 +235,15 @@ func printConnectPlan(
 	fmt.Fprintln(out)
 }
 
-// resolveKey either installs a key the caller already holds or mints a new one.
-func resolveKey(ctx context.Context, cfg *config.Config, h harness.Harness, f connectFlags) (string, api.ServerKey, error) {
+// resolveKey either installs a key the caller already holds or mints a new one. The
+// bool reports which happened, because only a key this invocation created is the
+// caller's to clean up if a later step fails.
+func resolveKey(ctx context.Context, cfg *config.Config, h harness.Harness, f connectFlags) (string, api.ServerKey, bool, error) {
 	if key := strings.TrimSpace(f.apiKey); key != "" {
 		if !strings.HasPrefix(key, "mir_srv_") {
-			return "", api.ServerKey{}, errors.New("--api-key expects a mir_srv_ server key")
+			return "", api.ServerKey{}, false, errors.New("--api-key expects a mir_srv_ server key")
 		}
-		return key, api.ServerKey{KeyPrefix: harness.MaskKey(key)}, nil
+		return key, api.ServerKey{KeyPrefix: harness.MaskKey(key)}, false, nil
 	}
 
 	name := strings.TrimSpace(f.keyName)
@@ -249,14 +253,14 @@ func resolveKey(ctx context.Context, cfg *config.Config, h harness.Harness, f co
 
 	client, err := newClient(cfg)
 	if err != nil {
-		return "", api.ServerKey{}, err
+		return "", api.ServerKey{}, false, err
 	}
 	key, meta, err := client.CreateServerKey(ctx, cfg.ProjectID, name,
 		"Created by mirador telemetry connect "+h.Name())
 	if err != nil {
-		return "", api.ServerKey{}, err
+		return "", api.ServerKey{}, false, err
 	}
-	return key, meta, nil
+	return key, meta, true, nil
 }
 
 // resourceAttributes are stamped on everything the harness emits.
@@ -317,10 +321,12 @@ func printConflicts(out io.Writer, conflicts []harness.Conflict, force bool) {
 // backupHarnessConfig snapshots the file before it is merged, when the harness exposes
 // a way to. Not part of the Harness interface: a harness whose config is not a single
 // file it owns has nothing meaningful to snapshot.
-func backupHarnessConfig(h harness.Harness) (string, error) {
-	type backuper interface{ Backup() (string, error) }
+func backupHarnessConfig(h harness.Harness, endpoint string) (string, error) {
+	type backuper interface {
+		Backup(endpoint string) (string, error)
+	}
 	if b, ok := h.(backuper); ok {
-		return b.Backup()
+		return b.Backup(endpoint)
 	}
 	return "", nil
 }
