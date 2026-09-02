@@ -27,12 +27,19 @@ const (
 	AttrProjectID = "mirador.project.id"
 )
 
-// ServiceName is the service.name a harness reports under. Derived from the harness
-// token so `claude` and `codex` are distinguishable in one project.
+// ServiceName is the service.name a harness reports under, which is what the filter
+// printed after a connect matches on.
+//
+// Claude Code's is set by Mirador through OTEL_RESOURCE_ATTRIBUTES. Codex's is not
+// configurable: it stamps its own originator on every resource, and for the `codex` CLI
+// that is "codex_cli_rs". The Codex desktop app and IDE extensions report under their
+// own originators, which this harness does not configure.
 func ServiceName(h Harness) string {
 	switch h.Name() {
 	case "claude":
 		return "claude-code"
+	case "codex":
+		return codexServiceName
 	default:
 		return h.Name()
 	}

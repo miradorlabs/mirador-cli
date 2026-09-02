@@ -67,12 +67,13 @@ func newTelemetryConnectCommand() *cobra.Command {
 		Long: `Mints a server key for the selected project and writes the harness's telemetry
 configuration.
 
-The key is created server-side and returned exactly once. By default it lands in a
-0700 helper script under ~/.mirador/helpers/ and the harness config gets only the
-script's path (Claude Code's otelHeadersHelper mechanism) — so the settings file
-never holds a credential and stays safe to share or keep in dotfiles. Pass
---inline-key to write the key into the settings file instead; that file is then
-tightened to 0600.
+The key is created server-side and returned exactly once. Where the harness can fetch
+its OTLP headers from a script at startup (Claude Code's otelHeadersHelper), the key
+lands in a 0700 helper script under ~/.mirador/helpers/ and the harness config gets
+only the script's path — so the settings file never holds a credential and stays safe
+to share or keep in dotfiles; pass --inline-key to write the key into the settings
+file instead. Codex has no such mechanism, so its key is always written into
+config.toml. Either way, a file that holds the key is tightened to 0600.
 
 Your existing settings are preserved — only Mirador's own keys are written, and
 ` + "`telemetry disconnect`" + ` removes exactly those. Reconnecting to the same project
@@ -91,7 +92,7 @@ key you already hold.`,
 	fl.StringVar(&f.keyName, "key-name", "", "name for the minted key (defaults to <harness>@<hostname>)")
 	fl.StringVar(&f.apiKey, "api-key", "", "install this existing mir_srv_ key instead of minting a new one")
 	fl.StringVar(&f.identity, "identity", "", "value for enduser.id (defaults to your global git email; \"none\" to omit)")
-	fl.BoolVar(&f.inlineKey, "inline-key", false, "store the key in the settings file instead of a Mirador headers-helper script")
+	fl.BoolVar(&f.inlineKey, "inline-key", false, "store the key in the settings file instead of a Mirador headers-helper script (Claude Code; Codex always stores it inline)")
 	fl.BoolVarP(&f.assumeYes, "yes", "y", false, "skip the confirmation prompt")
 	fl.BoolVar(&f.force, "force", false, "remove conflicting per-signal OTLP settings instead of refusing to connect")
 	return cmd
@@ -144,9 +145,10 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 		IncludePrompts:     !f.excludePrompts,
 		IncludeToolContent: !f.excludeToolContent,
 	}
-	// The default delivery: a Mirador-owned helper script supplies the Authorization
-	// header, so the harness's settings file never holds the key — only a path.
-	if !f.inlineKey {
+	// The default delivery, where the harness supports it: a Mirador-owned helper script
+	// supplies the Authorization header, so the harness's settings file never holds the
+	// key — only a path. A harness without the mechanism gets the key inline.
+	if !f.inlineKey && h.SupportsHeadersHelper() {
 		helperPath, err := harness.HelperFilePath(h, cfg.ProjectID)
 		if err != nil {
 			return err
@@ -159,16 +161,22 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 	}
 
 	printConnectPlan(out, h, cfg, detection, configPath, intended.HelperPath, signals, f)
+	printConnectNotes(out, h, intended)
 	printConflicts(out, conflicts, f.force)
 
-	// A conflict outside the user file — exported in the shell, or set in a project
-	// settings file that outranks it — cannot be cleared by writing to the user file, so
-	// --force must not pretend otherwise. Connecting anyway would install the credential
-	// while the override kept deciding where telemetry goes.
+	// Advisory conflicts — a Codex profile's overrides, which apply only when that
+	// profile is selected — are shown above and do not gate the connect.
+	conflicts, _ = partitionConflicts(conflicts)
+
+	// A conflict Mirador does not change — exported in the shell, set in a managed file
+	// that outranks the user config, or a setting that is the user's own opt-out —
+	// cannot be cleared by writing to the user file, so --force must not pretend
+	// otherwise. Connecting anyway would install the credential while the override
+	// kept deciding where telemetry goes.
 	if blocking := unclearable(conflicts); len(blocking) > 0 {
 		return fmt.Errorf(
-			"%s reads these from outside your user settings, where Mirador cannot change them: %s — unset or remove them, then retry",
-			h.DisplayName(), strings.Join(blocking, ", "))
+			"%s has settings Mirador does not change: %s — remove or adjust them, then retry",
+			h.DisplayName(), output.SanitizeTerminal(strings.Join(blocking, ", ")))
 	}
 	if len(conflicts) > 0 && !f.force {
 		return fmt.Errorf(
@@ -268,6 +276,8 @@ func printConnectPlan(
 	fmt.Fprintf(out, "    %s\n", configPath)
 	if helperPath != "" {
 		fmt.Fprintf(out, "    %s  (holds the key; the settings file will not)\n", helperPath)
+	} else {
+		fmt.Fprintln(out, "    (the server key is written into this file, which is tightened to 0600)")
 	}
 	if f.apiKey == "" {
 		// Reuse is decided after the plan (it needs the config read that minting also
@@ -275,6 +285,28 @@ func printConnectPlan(
 		fmt.Fprintln(out, "\n  A server key will be minted for this project — unless one is already installed here, which will be reused.")
 	} else {
 		fmt.Fprintf(out, "\n  Installing the key you supplied (%s).\n", harness.MaskKey(f.apiKey))
+	}
+	fmt.Fprintln(out)
+}
+
+// printConnectNotes prints what a harness wants said about this particular connect —
+// a side effect of its own, or a limit of what its switches can do — before the user
+// is asked to confirm. Optional: most connects have nothing to add.
+func printConnectNotes(out io.Writer, h harness.Harness, e harness.Exporter) {
+	type noter interface {
+		ConnectNotes(e harness.Exporter) []string
+	}
+	n, ok := h.(noter)
+	if !ok {
+		return
+	}
+	notes := n.ConnectNotes(e)
+	if len(notes) == 0 {
+		return
+	}
+	fmt.Fprintln(out, "  Note:")
+	for _, note := range notes {
+		fmt.Fprintf(out, "    %s\n", output.SanitizeTerminal(note))
 	}
 	fmt.Fprintln(out)
 }
@@ -351,35 +383,65 @@ func resourceAttributes(ctx context.Context, h harness.Harness, cfg *config.Conf
 
 // printConflicts explains what is in the way, naming each variable so the user can go
 // and look at it. A header value is never printed: it is the one that may hold someone
-// else's credential.
+// else's credential. Every field is sanitized on the way to the terminal — a key can
+// carry a file name, and a file name can carry anything.
 func printConflicts(out io.Writer, conflicts []harness.Conflict, force bool) {
-	if len(conflicts) == 0 {
-		return
-	}
+	blocking, advisory := partitionConflicts(conflicts)
 
-	if force {
-		fmt.Fprintln(out, "  Conflicting settings, which --force will remove where it can:")
-	} else {
-		fmt.Fprintln(out, "  Conflicting settings:")
-	}
-	for _, c := range conflicts {
-		if c.Value != "" {
-			fmt.Fprintf(out, "    %s=%s\n", c.Key, output.SanitizeTerminal(c.Value))
+	if len(blocking) > 0 {
+		if force {
+			fmt.Fprintln(out, "  Conflicting settings, which --force will remove where it can:")
 		} else {
-			fmt.Fprintf(out, "    %s\n", c.Key)
+			fmt.Fprintln(out, "  Conflicting settings:")
 		}
-		marker := " "
-		if c.Credential {
-			marker = "!"
+		for _, c := range blocking {
+			printConflict(out, c)
 		}
-		fmt.Fprintf(out, "     %s [%s] %s\n", marker, c.Scope, output.SanitizeTerminal(c.Reason))
-		if !c.Clearable {
-			// Say it here as well as in the error: this is the one the user has to go
-			// and fix themselves.
+		fmt.Fprintln(out)
+	}
+	if len(advisory) > 0 {
+		fmt.Fprintln(out, "  Overrides that apply only in a mode you select explicitly — reported, not blocking:")
+		for _, c := range advisory {
+			printConflict(out, c)
+		}
+		fmt.Fprintln(out)
+	}
+}
+
+func printConflict(out io.Writer, c harness.Conflict) {
+	key := output.SanitizeTerminal(c.Key)
+	if c.Value != "" {
+		fmt.Fprintf(out, "    %s=%s\n", key, output.SanitizeTerminal(c.Value))
+	} else {
+		fmt.Fprintf(out, "    %s\n", key)
+	}
+	marker := " "
+	if c.Credential {
+		marker = "!"
+	}
+	fmt.Fprintf(out, "     %s [%s] %s\n", marker, output.SanitizeTerminal(c.Scope), output.SanitizeTerminal(c.Reason))
+	if !c.Clearable && !c.Advisory {
+		// Say it here as well as in the error: this is the one the user has to go
+		// and fix themselves.
+		if c.Scope == harness.ScopeUserSettings {
+			fmt.Fprintf(out, "       Mirador does not change this — it is your setting to remove.\n")
+		} else {
 			fmt.Fprintf(out, "       Mirador cannot change this — it is outside your user settings.\n")
 		}
 	}
-	fmt.Fprintln(out)
+}
+
+// partitionConflicts separates the conflicts that gate a connect from the advisory
+// ones, which are reported and nothing more.
+func partitionConflicts(conflicts []harness.Conflict) (blocking, advisory []harness.Conflict) {
+	for _, c := range conflicts {
+		if c.Advisory {
+			advisory = append(advisory, c)
+		} else {
+			blocking = append(blocking, c)
+		}
+	}
+	return blocking, advisory
 }
 
 // unclearable names the conflicts --force cannot resolve, which are fatal.
@@ -479,7 +541,11 @@ type telemetryStatus struct {
 	// the truth. Reporting a Mirador endpoint while a per-signal override quietly sends
 	// that signal — and the credential — elsewhere is the failure this exists to prevent.
 	Conflicts []string `json:"conflicts,omitempty"`
-	Error     string   `json:"error,omitempty"`
+	// Warnings names overrides that apply only in a mode the user selects explicitly —
+	// a Codex profile. They do not make the harness "overridden", since whether they
+	// apply to the next session is not knowable here.
+	Warnings []string `json:"warnings,omitempty"`
+	Error    string   `json:"error,omitempty"`
 }
 
 func describeStatus(ctx context.Context, h harness.Harness, cfg *config.Config) telemetryStatus {
@@ -509,8 +575,12 @@ func describeStatus(ctx context.Context, h harness.Harness, cfg *config.Config) 
 	entry.Endpoint = st.Endpoint
 	entry.ProjectID = st.ProjectID
 	entry.KeyPrefix = st.KeyPrefix
-	for _, c := range st.Conflicts {
+	blocking, advisory := partitionConflicts(st.Conflicts)
+	for _, c := range blocking {
 		entry.Conflicts = append(entry.Conflicts, c.Key)
+	}
+	for _, c := range advisory {
+		entry.Warnings = append(entry.Warnings, c.Key)
 	}
 
 	switch {
@@ -523,7 +593,7 @@ func describeStatus(ctx context.Context, h harness.Harness, cfg *config.Config) 
 		}
 		entry.State = "not connected"
 		return entry
-	case len(st.Conflicts) > 0:
+	case len(blocking) > 0:
 		// Say this rather than "connected": some signal is going somewhere else, and the
 		// endpoint column alone would be a lie.
 		entry.State = "connected, overridden"

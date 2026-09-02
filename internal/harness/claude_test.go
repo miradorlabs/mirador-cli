@@ -456,17 +456,23 @@ func TestLookupRejectsUnknownHarness(t *testing.T) {
 	}
 }
 
-// Codex is registered so it shows up in --help, but must fail clearly rather than
-// pretending to work.
-func TestCodexReportsUnsupportedRatherThanFailingOpaquely(t *testing.T) {
-	h, err := Lookup("codex")
-	if err != nil {
-		t.Fatalf("Lookup: %v", err)
-	}
-	if _, err := h.Status(); err == nil {
-		t.Fatal("Codex.Status succeeded; it is not implemented")
-	} else if !strings.Contains(err.Error(), "not supported yet") {
-		t.Errorf("Codex error = %q, want it to say it is unsupported", err)
+// Every registered harness must answer a status query against an empty sandbox — a
+// stub that errors would make `telemetry status` report it as broken.
+func TestEveryHarnessReportsStatusInASandbox(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("CODEX_HOME", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", filepath.Join(dir, "mirador"))
+
+	for _, h := range All() {
+		st, err := h.Status()
+		if err != nil {
+			t.Errorf("%s.Status: %v", h.Name(), err)
+			continue
+		}
+		if st.Connected || st.Exists {
+			t.Errorf("%s reported connected=%v exists=%v in an empty sandbox", h.Name(), st.Connected, st.Exists)
+		}
 	}
 }
 

@@ -12,7 +12,8 @@ import (
 )
 
 // settingsFile is a harness config file whose telemetry lives in a JSON `env` object —
-// the shape Claude Code uses, and the one Codex is expected to follow.
+// the shape Claude Code uses. Codex keeps its telemetry in a TOML table instead; see
+// tomlFile.
 //
 // Every value is held as json.RawMessage so a merge is non-destructive: settings this
 // CLI has never heard of survive byte-for-byte, including their nested key order. Only
@@ -59,28 +60,11 @@ func loadSettings(path string) (*settingsFile, error) {
 		mode:      settingsMode,
 	}
 
-	// A symlink is resolved so the write lands on the real file and the link survives.
-	// A *dangling* link is refused rather than followed: writing to the link path would
-	// replace it with a regular file, silently detaching a dotfiles setup from its repo,
-	// and there is no safe way to guess where the missing target was meant to live.
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		s.symlinked = true
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			target, readErr := os.Readlink(path)
-			if readErr != nil {
-				target = "its target"
-			}
-			return nil, fmt.Errorf(
-				"%s is a symlink to %s, which does not exist — restore it or replace the link, then retry",
-				path, target)
-		}
-		s.writePath = resolved
-	} else if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		// Not a link itself, but a parent directory may be one; resolve so the atomic
-		// rename happens in the directory the file actually lives in.
-		s.writePath = resolved
+	writePath, symlinked, err := resolveWritePath(path)
+	if err != nil {
+		return nil, err
 	}
+	s.writePath, s.symlinked = writePath, symlinked
 
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -203,11 +187,45 @@ func (s *settingsFile) save(tighten bool) error {
 // Best-effort by design: a failure to write the backup must not block the connect the
 // user asked for, so the caller reports it as a warning.
 func (s *settingsFile) backup(replace bool) (string, error) {
-	if !s.existed {
+	return backupFile(s.writePath, s.existed, replace)
+}
+
+// resolveWritePath is where a config file should actually be written, given the path
+// the harness reads it from.
+//
+// A symlink is resolved so the write lands on the real file and the link survives. A
+// *dangling* link is refused rather than followed: writing to the link path would
+// replace it with a regular file, silently detaching a dotfiles setup from its repo,
+// and there is no safe way to guess where the missing target was meant to live.
+func resolveWritePath(path string) (writePath string, symlinked bool, err error) {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			target, readErr := os.Readlink(path)
+			if readErr != nil {
+				target = "its target"
+			}
+			return "", true, fmt.Errorf(
+				"%s is a symlink to %s, which does not exist — restore it or replace the link, then retry",
+				path, target)
+		}
+		return resolved, true, nil
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		// Not a link itself, but a parent directory may be one; resolve so the atomic
+		// rename happens in the directory the file actually lives in.
+		return resolved, false, nil
+	}
+	return path, false, nil
+}
+
+// backupFile copies writePath to writePath.mirador.bak — alongside the real file, not
+// the link that points at it. See settingsFile.backup for when replace is set.
+func backupFile(writePath string, existed, replace bool) (string, error) {
+	if !existed {
 		return "", nil
 	}
-	// Alongside the real file, not the link that points at it.
-	path := s.writePath + ".mirador.bak"
+	path := writePath + ".mirador.bak"
 	if _, err := os.Stat(path); err == nil {
 		if !replace {
 			return path, nil
@@ -216,7 +234,7 @@ func (s *settingsFile) backup(replace bool) (string, error) {
 		return "", err
 	}
 
-	data, err := os.ReadFile(s.writePath)
+	data, err := os.ReadFile(writePath)
 	if err != nil {
 		return "", err
 	}

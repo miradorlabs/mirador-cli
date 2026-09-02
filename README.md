@@ -198,33 +198,56 @@ renamed, not against a command calling the wrong endpoint.
 
 `mirador telemetry` configures an agent CLI to export OpenTelemetry to Mirador, so the
 traces you read with `mirador trace list` include the agent sessions that produced the
-work.
+work. Claude Code and Codex are supported.
 
 ```bash
 mirador telemetry connect claude
+mirador telemetry connect codex
 ```
 
 It mints a server key scoped to the selected project — or, when this project already
 has one installed here, reuses it rather than minting an orphan — and writes the OTLP
-configuration into the harness's own settings: for Claude Code, the `env` block of
-`~/.claude/settings.json`. Nothing is added to your shell profile, and every other
-setting in that file is preserved; a `.mirador.bak` copy of the original is written
-alongside it.
+configuration into the harness's own settings. Nothing is added to your shell profile,
+every other setting in that file is preserved, and a `.mirador.bak` copy of the original
+is written alongside it.
 
-**The key itself never enters `settings.json`.** It lands in a `0700` helper script
-under `~/.mirador/helpers/`, and the settings file gets only the script's path via
-Claude Code's `otelHeadersHelper` mechanism — Claude runs the script to fetch the
-`Authorization` header at startup and refreshes it periodically. Your settings file
-therefore stays free of credentials: safe to diff, share, or keep in a dotfiles repo,
-at whatever permissions you had it. Prefer everything in one file? `--inline-key`
-writes the key into `settings.json` the classic way and tightens it to `0600`.
+| Harness | Config written | Where the key lives |
+|---------|----------------|---------------------|
+| Claude Code | `env` block of `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`) | a `0700` helper script under `~/.mirador/helpers/`; the settings file gets only its path |
+| Codex | `[otel]` table of `~/.codex/config.toml` (or `$CODEX_HOME`) | inline in `config.toml`, which is tightened to `0600` |
+
+**For Claude Code the key never enters `settings.json`.** It lands in the helper script,
+and the settings file gets only the script's path via Claude Code's `otelHeadersHelper`
+mechanism — Claude runs the script to fetch the `Authorization` header at startup and
+refreshes it periodically. Your settings file therefore stays free of credentials: safe
+to diff, share, or keep in a dotfiles repo, at whatever permissions you had it. Prefer
+everything in one file? `--inline-key` writes the key into `settings.json` the classic
+way and tightens it to `0600`.
+
+**Codex has no equivalent mechanism.** Its exporters are configured in `config.toml`
+with literal header values, so the key is written there and the file is tightened to
+`0600`. Only the `[otel]` table is rewritten: the rest of `config.toml` — comments,
+MCP servers, profiles, key order — is preserved byte for byte, and the result is
+re-parsed and checked before it is written. Keys inside `[otel]` that Mirador does not
+own (`environment`, for instance) survive too, and so do your own entries in
+`span_attributes`: Mirador adds and later removes only its `enduser.id` and
+`mirador.project.id` there. Comments inside that one table do not survive.
 
 With Claude Code's enhanced telemetry on you get spans for each interaction, model
 request and retry, tool execution and subagent, plus structured events and metrics for
 token usage, cost, commits and lines changed.
 
+Codex exports spans per turn and model request carrying `gen_ai.usage.*` token counts;
+`codex.*` events including `codex.sse_event` with per-response input, output, cached
+and reasoning token counts, `codex.user_prompt`, `codex.tool_decision`,
+`codex.tool_result`, and `codex.turn_cost` with the estimated USD; and metrics
+including `codex.turn.token_usage` and `codex.turn.cost_microusd`. Codex reports under
+its own `service.name` of `codex_cli_rs` (the desktop app and IDE extensions use their
+own), and Mirador's `enduser.id` and project attribution ride on spans as
+`span_attributes`, which is the only per-user attribute Codex accepts.
+
 ```
-Claude Code found: 2.1.220
+Codex found: 0.152.0
   Mirador project: Payments (proj_123)
   Endpoint:        https://otel.mirador.org
 
@@ -237,37 +260,60 @@ Claude Code found: 2.1.220
     Tool content: on
 
   This will update:
-    /Users/you/.claude/settings.json
+    /Users/you/.codex/config.toml
+    (the server key is written into this file, which is tightened to 0600)
 
   A server key will be minted for this project — unless one is already installed here, which will be reused.
 
-Connect Claude Code to Mirador? [Y/n] y
+  Note:
+    Codex sends metrics to OpenAI (statsig) unless configured otherwise; after this connect they go to Mirador instead.
 
-Connected. Restart Claude Code, then run a prompt.
-View traces with: mirador trace list --filter 'attribute.service.name="claude-code"'
+Connect Codex to Mirador? [Y/n] y
+
+Connected. Restart Codex, then run a prompt.
+View traces with: mirador trace list --filter 'attribute.service.name="codex_cli_rs"'
 ```
 
 ### What gets sent
 
-**Everything, by default** — all three signals, plus prompt text, model responses, and
-tool input/output. That content is what makes an agent trace answer questions; a
-redacted trace mostly can't. It also means what you and the model said leaves the
-machine, so redaction is a flag away, and the two exclusions are independent:
+**Everything, by default** — all three signals, plus prompt text and tool content. That
+content is what makes an agent trace answer questions; a redacted trace mostly can't. It
+also means what you and the model said leaves the machine, so redaction is a flag away,
+and the two exclusions are independent:
 
 ```bash
 mirador telemetry connect claude --exclude-prompts        # no prompt text or model responses
 mirador telemetry connect claude --exclude-tool-content   # no tool parameters, input, or output
 ```
 
-With prompts excluded, Claude Code still reports prompt *length*, so you keep the shape
-of a session without its contents. Either way the connect plan prints the capture
-posture before asking for confirmation.
+What each flag can do depends on the harness:
+
+- **Claude Code** exports prompt text and model responses (`--exclude-prompts` drops
+  both, keeping prompt *length*), and tool parameters, input and output
+  (`--exclude-tool-content` drops all of them).
+- **Codex** exports your prompt text (`log_user_prompt`) and never exports model
+  response text, so `--exclude-prompts` is exactly that one switch. Tool output is
+  previewed up to `otel.tool_result.max_bytes` (2 KiB by Codex's default; raise it in
+  `config.toml` for more), and `--exclude-tool-content` sets that to zero — but Codex
+  has no switch for tool *arguments*, so the command or parameters of each tool call
+  are still exported. The connect plan says so before asking.
+
+Either way the plan prints the capture posture before asking for confirmation.
 
 Pick a subset of signals with `--signals`:
 
 ```bash
 mirador telemetry connect claude --signals traces,logs
+mirador telemetry connect codex --signals traces,logs
 ```
+
+For Codex, signals you leave out are left exactly as they were rather than switched off:
+by default that is off for logs and traces, and OpenAI's own `statsig` route for
+metrics. Connecting the metrics signal replaces that route with Mirador — the plan notes
+it — and disconnecting puts it back. If `config.toml` opts out of analytics
+(`[analytics]` with `enabled = false`), Codex exports no metrics at all whatever the
+exporter says, so a connect that includes metrics refuses rather than report a signal
+that would never arrive; connect with `--signals traces,logs`, or remove the setting.
 
 Other useful flags: `--key-name` to name the minted key, `--api-key` to install a key you
 already hold instead of minting one, and `-y` to skip the prompt.
@@ -276,8 +322,8 @@ already hold instead of minting one, and `-y` to skip the prompt.
 
 ```bash
 mirador telemetry status              # every harness
-mirador telemetry status claude
-mirador telemetry disconnect claude
+mirador telemetry status codex
+mirador telemetry disconnect codex
 ```
 
 `status` reads the harness's own config, so it reports what the harness is set up to
@@ -293,12 +339,34 @@ script is deleted along with its setting. The server key itself stays live, sinc
 bound to the project rather than to the machine — `disconnect` prints its masked prefix
 so you can find and revoke it in the web app.
 
+Both harnesses layer settings from other places over the user file Mirador writes.
+Claude Code reads project `.claude/settings.json` files and the shell environment; the
+scan covers the directory you run `connect` from, so a session started elsewhere may
+see different project settings. Codex applies an administrator's `managed_config.toml`
+(`/etc/codex/managed_config.toml` on macOS and Linux; `~/.codex/managed_config.toml`
+on Windows, which Codex 0.150 and later ignore with a startup warning but earlier builds
+honour) and, on macOS, the `com.openai.codex` managed preference an MDM profile
+delivers. Codex deliberately ignores `otel` in a project's `.codex/config.toml`, so that
+is neither honoured nor scanned. In each layer Mirador checks not just the exporters but
+everything that could overturn the plan it printed: `log_user_prompt`,
+`tool_result.max_bytes`, the `enduser.id` and `mirador.project.id` span attributes, and
+`[analytics] enabled`. A managed setting that contradicts the connect is a conflict
+Mirador cannot clear, and connect refuses until it is removed.
+
+Codex profile files (`<name>.config.toml` beside `config.toml`) are layered over the
+user config only while that profile is selected with `--profile <name>`, and Mirador
+cannot know which profile a session will use. Their overrides are therefore checked the
+same way but reported as advisory — printed before the confirmation with the profile
+named, listed under `warnings` in `status --output json` — without blocking the connect
+or marking the harness overridden.
+
+`disconnect codex` acts only on what its own journal records. No earlier release wrote
+a Codex config, so a `[otel]` table without a journal is somebody else's — a company
+collector, say — and is neither counted, described by key prefix, nor removed.
+
 Minting a key needs a user credential, so `telemetry connect` requires `mirador login`;
 a `mir_srv_` key in `MIRADOR_API_KEY` cannot mint another. Use `--api-key` to install a
 key you already have.
-
-`codex` is listed and will report itself as not yet supported: it does not expose a
-stable set of OTLP environment variables to write.
 
 ## Filters and time windows
 

@@ -1,11 +1,12 @@
-// Package harness configures agent CLIs — Claude Code today, Codex next — to export
+// Package harness configures agent CLIs — Claude Code and Codex — to export
 // OpenTelemetry to Mirador.
 //
 // Each harness owns exactly one thing: the translation between a Mirador Exporter and
-// whatever configuration file and environment-variable names that vendor happens to
-// use. Nothing outside this package knows that Claude Code reads ~/.claude/settings.json
-// or spells its telemetry switch CLAUDE_CODE_ENABLE_TELEMETRY, which is what keeps
-// `mirador telemetry` a single command tree rather than one per vendor.
+// whatever configuration file and setting names that vendor happens to use. Nothing
+// outside this package knows that Claude Code reads ~/.claude/settings.json and spells
+// its telemetry switch CLAUDE_CODE_ENABLE_TELEMETRY, or that Codex reads an `[otel]`
+// table in ~/.codex/config.toml, which is what keeps `mirador telemetry` a single
+// command tree rather than one per vendor.
 //
 // The split between Render and Connect is deliberate: Render is pure, so the CLI can
 // show a user exactly what a connect would write — including which redaction switches
@@ -182,6 +183,12 @@ type Conflict struct {
 	// clearable is fatal even under --force: pretending to fix it would write the
 	// credential and leave the override in force.
 	Clearable bool
+
+	// Advisory marks a setting that only takes effect in a mode the user has to select
+	// explicitly — a Codex profile — so whether it applies to the next session cannot be
+	// known here. It is reported so the user can decide, but it neither blocks a connect
+	// nor needs --force, and status does not call the harness overridden for it.
+	Advisory bool
 }
 
 // Conflict scopes.
@@ -189,6 +196,12 @@ const (
 	ScopeUserSettings = "user settings"
 	ScopeEnvironment  = "shell environment"
 	ScopeProject      = "project settings"
+	// ScopeManaged is an administrator-managed layer that outranks everything the user
+	// writes — Codex's /etc/codex/managed_config.toml, or its macOS managed preference.
+	ScopeManaged = "managed settings"
+	// ScopeProfile is a Codex profile file, `<name>.config.toml`, applied over the user
+	// config while that profile is selected.
+	ScopeProfile = "profile settings"
 )
 
 // DisconnectResult reports what a disconnect actually did. Removed and Restored are
@@ -247,6 +260,12 @@ type Harness interface {
 
 	// ConfigPath is the file Connect and Disconnect write.
 	ConfigPath() (string, error)
+
+	// SupportsHeadersHelper reports whether the harness can fetch its OTLP headers from
+	// a script at startup, so the credential can live outside its config file. Without
+	// it the key is written inline and the file's mode is tightened instead; the
+	// Exporter's HelperPath is then ignored.
+	SupportsHeadersHelper() bool
 
 	// Render translates an Exporter into this harness's environment variables. Pure:
 	// no file is read and none is written, so the CLI can preview it.
@@ -311,7 +330,8 @@ func Lookup(name string) (Harness, error) {
 }
 
 // ErrUnsupported is returned by a harness that is registered but not yet implemented,
-// so `--help` can name it before it works.
+// so `--help` can name it before it works. No registered harness returns it today; it
+// stays so the next one can be listed before it is finished.
 type ErrUnsupported struct {
 	Harness string
 	Reason  string

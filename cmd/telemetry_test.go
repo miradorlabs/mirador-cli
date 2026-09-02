@@ -156,6 +156,7 @@ func TestTelemetryRejectsNonServerKey(t *testing.T) {
 // usable when a login has expired.
 func TestTelemetryStatusNeedsNoCredential(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
 	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
 
 	var out bytes.Buffer
@@ -172,10 +173,9 @@ func TestTelemetryStatusNeedsNoCredential(t *testing.T) {
 	}
 }
 
-// An unimplemented harness is a state, not a failure — listing Codex must not make
-// `telemetry status` exit non-zero.
-func TestTelemetryStatusReportsCodexAsUnsupported(t *testing.T) {
+func TestTelemetryStatusReportsCodexNotConnected(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
 	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
 
 	var out bytes.Buffer
@@ -185,10 +185,233 @@ func TestTelemetryStatusReportsCodexAsUnsupported(t *testing.T) {
 	root.SetArgs([]string{"telemetry", "status", "codex", "-o", "json"})
 
 	if err := root.Execute(); err != nil {
-		t.Fatalf("status on an unsupported harness returned an error: %v", err)
+		t.Fatalf("status: %v", err)
 	}
-	if !strings.Contains(out.String(), "unsupported") {
-		t.Errorf("codex was not reported as unsupported:\n%s", out.String())
+	if !strings.Contains(out.String(), `"state": "not connected"`) {
+		t.Errorf("codex in an empty sandbox was not reported as not connected:\n%s", out.String())
+	}
+}
+
+// The Codex lifecycle end to end: connect writes the key into config.toml and nothing
+// else, status reads it back, disconnect restores the file byte for byte.
+func TestTelemetryCodexConnectStatusDisconnect(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+
+	const seed = "# my config\nmodel = \"gpt-5\"\n\n[mcp_servers.foo]\ncommand = \"foo\"\n"
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	run := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		root := NewRootCommand()
+		root.SetOut(&out)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(args)
+		err := root.Execute()
+		return out.String(), err
+	}
+
+	out, err := run("telemetry", "connect", "codex",
+		"--api-key", "mir_srv_codex123",
+		"--project", "770e8400-e29b-41d4-a716-446655440000",
+		"--yes")
+	if err != nil {
+		t.Fatalf("connect: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "written into this file") {
+		t.Errorf("the plan did not say the key goes inline:\n%s", out)
+	}
+	if !strings.Contains(out, `--filter 'attribute.service.name="codex_cli_rs"'`) {
+		t.Errorf("connect did not print the filter matching Codex's own service.name:\n%s", out)
+	}
+	if strings.Contains(out, "helpers") {
+		t.Errorf("a headers helper was mentioned for a harness that has none:\n%s", out)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.HasPrefix(string(data), seed) || !strings.Contains(string(data), "mir_srv_codex123") {
+		t.Fatalf("config.toml after connect:\n%s", data)
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm()&0o077 != 0 {
+		t.Errorf("config.toml mode = %#o, want it tightened", info.Mode().Perm())
+	}
+
+	out, err = run("telemetry", "status", "codex", "-o", "json")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(out, `"state": "connected"`) || !strings.Contains(out, `"project_id": "770e8400-e29b-41d4-a716-446655440000"`) {
+		t.Errorf("status after connect:\n%s", out)
+	}
+	if strings.Contains(out, "mir_srv_codex123") {
+		t.Error("status printed the whole key")
+	}
+
+	if _, err := run("telemetry", "disconnect", "codex", "--yes"); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	if data, _ := os.ReadFile(path); string(data) != seed {
+		t.Fatalf("config.toml after disconnect:\n%s\nwant the original:\n%s", data, seed)
+	}
+}
+
+// With analytics disabled Codex sends no metrics whatever the exporter says. A full
+// connect must refuse rather than report metrics connected; without metrics it works.
+func TestTelemetryCodexRefusesMetricsWhenAnalyticsDisabled(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+	const seed = "[analytics]\nenabled = false\n"
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	connect := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		root := NewRootCommand()
+		root.SetOut(&out)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(append([]string{
+			"telemetry", "connect", "codex",
+			"--api-key", "mir_srv_secret",
+			"--project", "770e8400-e29b-41d4-a716-446655440000",
+			"--yes",
+		}, args...))
+		err := root.Execute()
+		return out.String(), err
+	}
+
+	out, err := connect()
+	if err == nil || !strings.Contains(err.Error(), "analytics.enabled") {
+		t.Fatalf("connect error = %v, want analytics.enabled named", err)
+	}
+	if !strings.Contains(out, "--signals traces,logs") {
+		t.Errorf("the conflict did not point at the way out:\n%s", out)
+	}
+	if data, _ := os.ReadFile(path); string(data) != seed {
+		t.Fatalf("the config was modified despite the refusal:\n%s", data)
+	}
+
+	if out, err := connect("--force"); err == nil {
+		t.Fatalf("--force flipped the user's analytics opt-out:\n%s", out)
+	}
+	if _, err := connect("--signals", "traces,logs"); err != nil {
+		t.Fatalf("connect without metrics: %v", err)
+	}
+}
+
+// A dormant profile that overturns the privacy posture — or points a signal elsewhere —
+// is reported before the confirmation, with the profile named, but does not block a
+// connect that the plain configuration asked for; status likewise lists it as a warning
+// rather than calling the harness overridden.
+func TestTelemetryCodexProfileOverridesAreReportedNotBlocking(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+	profile := "[analytics]\nenabled = false\n\n[otel]\nexporter = \"none\"\nlog_user_prompt = true\ntool_result = { max_bytes = 2048 }\n"
+	if err := os.WriteFile(filepath.Join(dir, "work.config.toml"), []byte(profile), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var out bytes.Buffer
+	root := NewRootCommand()
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"telemetry", "connect", "codex",
+		"--api-key", "mir_srv_profiles",
+		"--project", "770e8400-e29b-41d4-a716-446655440000",
+		"--exclude-prompts", "--exclude-tool-content",
+		"--yes",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("a dormant profile blocked the connect: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "reported, not blocking") {
+		t.Errorf("the plan did not introduce the profile overrides as advisory:\n%s", got)
+	}
+	for _, key := range []string{
+		"work.config.toml:otel.exporter=none",
+		"work.config.toml:otel.log_user_prompt=true",
+		"work.config.toml:otel.tool_result.max_bytes=2048",
+		"work.config.toml:analytics.enabled=false",
+	} {
+		if !strings.Contains(got, key) {
+			t.Errorf("the plan did not name %s:\n%s", key, got)
+		}
+	}
+	if !strings.Contains(got, "--profile work") {
+		t.Errorf("the plan did not say which profile selects the overrides:\n%s", got)
+	}
+
+	out.Reset()
+	root = NewRootCommand()
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"telemetry", "status", "codex", "-o", "json"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(out.String(), `"state": "connected"`) || strings.Contains(out.String(), "overridden") {
+		t.Errorf("status treated a dormant profile as an override:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), `"warnings"`) || !strings.Contains(out.String(), "work.config.toml:otel.log_user_prompt") {
+		t.Errorf("status did not list the profile overrides as warnings:\n%s", out.String())
+	}
+}
+
+// A conflict key can carry a file name, and a file name can carry anything. What
+// reaches the terminal must be stripped of control characters, key included.
+func TestPrintConflictsSanitizesEveryField(t *testing.T) {
+	var out bytes.Buffer
+	printConflicts(&out, []harness.Conflict{{
+		Key:    "evil\x1b[31m.config.toml:otel.exporter",
+		Value:  "https://x\x1b[0m",
+		Reason: "because\x07",
+		Scope:  harness.ScopeProfile + "\x1b[2J",
+	}}, false)
+	if strings.ContainsAny(out.String(), "\x1b\x07") {
+		t.Fatalf("control characters reached the output:\n%q", out.String())
+	}
+	if !strings.Contains(out.String(), "evil[31m.config.toml:otel.exporter") {
+		t.Errorf("the key was not printed with only its control characters removed:\n%q", out.String())
+	}
+}
+
+// --inline-key is Claude's opt-out of the helper; for Codex inline is the only mode,
+// and the flag must be accepted rather than rejected as inapplicable.
+func TestTelemetryCodexInlineKeyFlagIsAccepted(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"telemetry", "connect", "codex",
+		"--api-key", "mir_srv_inline",
+		"--project", "770e8400-e29b-41d4-a716-446655440000",
+		"--inline-key", "--yes",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "config.toml"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(data), "mir_srv_inline") {
+		t.Fatal("the key was not written")
 	}
 }
 
