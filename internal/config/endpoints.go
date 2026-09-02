@@ -11,4 +11,9 @@ const (
 	DefaultAPIURL  = "https://api.mirador.org"
 	DefaultAuthURL = "https://auth.mirador.org"
 	DefaultAppURL  = "https://app.mirador.org"
+
+	// DefaultOTLPURL is the OTLP ingest host. Unlike the three above, the CLI never
+	// sends anything here itself — it writes this URL into an agent harness's own
+	// configuration, and the harness exports to it directly.
+	DefaultOTLPURL = "https://otel.mirador.org"
 )

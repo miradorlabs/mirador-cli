@@ -25,6 +25,7 @@ type globalFlags struct {
 	apiURL    string
 	authURL   string
 	appURL    string
+	otlpURL   string
 	projectID string
 	output    string
 }
@@ -55,7 +56,8 @@ pins one project and skips the browser entirely.`,
 	pf.StringVar(&flags.apiURL, "api-url", "", "Mirador data API base URL")
 	pf.StringVar(&flags.authURL, "auth-url", "", "Mirador auth API base URL")
 	pf.StringVar(&flags.appURL, "app-url", "", "Mirador app base URL (used by login)")
-	for _, name := range []string{"api-url", "auth-url", "app-url"} {
+	pf.StringVar(&flags.otlpURL, "otlp-url", "", "Mirador OTLP ingest URL (used by telemetry connect)")
+	for _, name := range []string{"api-url", "auth-url", "app-url", "otlp-url"} {
 		_ = pf.MarkHidden(name)
 	}
 	pf.StringVarP(&flags.projectID, "project", "p", "", "project to scope this command to")
@@ -75,6 +77,7 @@ pins one project and skips the browser entirely.`,
 		newMetricAlertCommand(),
 		newDerivedMetricCommand(),
 		newIntegrationCommand(),
+		newTelemetryCommand(),
 	)
 	return root
 }
@@ -141,6 +144,7 @@ func loadConfig() (*config.Config, error) {
 		APIURL:    flags.apiURL,
 		AuthURL:   flags.authURL,
 		AppURL:    flags.appURL,
+		OTLPURL:   flags.otlpURL,
 		ProjectID: flags.projectID,
 	})
 }

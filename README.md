@@ -191,7 +191,114 @@ renamed, not against a command calling the wrong endpoint.
 | `mirador metric-alert list \| get \| apply \| delete` | Manage metric alerts |
 | `mirador derived-metric list \| get \| apply \| delete \| dry-run` | Author derived metrics |
 | `mirador integration list \| get` | Notification channels alerts can name |
+| `mirador telemetry connect \| status \| disconnect` | Point an agent harness at Mirador |
 | `mirador config show \| profiles \| use \| set` | Manage configuration profiles |
+
+## Agent telemetry
+
+`mirador telemetry` configures an agent CLI to export OpenTelemetry to Mirador, so the
+traces you read with `mirador trace list` include the agent sessions that produced the
+work.
+
+```bash
+mirador telemetry connect claude
+```
+
+It mints a server key scoped to the selected project — or, when this project already
+has one installed here, reuses it rather than minting an orphan — and writes the OTLP
+configuration into the harness's own settings: for Claude Code, the `env` block of
+`~/.claude/settings.json`. Nothing is added to your shell profile, and every other
+setting in that file is preserved; a `.mirador.bak` copy of the original is written
+alongside it.
+
+**The key itself never enters `settings.json`.** It lands in a `0700` helper script
+under `~/.mirador/helpers/`, and the settings file gets only the script's path via
+Claude Code's `otelHeadersHelper` mechanism — Claude runs the script to fetch the
+`Authorization` header at startup and refreshes it periodically. Your settings file
+therefore stays free of credentials: safe to diff, share, or keep in a dotfiles repo,
+at whatever permissions you had it. Prefer everything in one file? `--inline-key`
+writes the key into `settings.json` the classic way and tightens it to `0600`.
+
+With Claude Code's enhanced telemetry on you get spans for each interaction, model
+request and retry, tool execution and subagent, plus structured events and metrics for
+token usage, cost, commits and lines changed.
+
+```
+Claude Code found: 2.1.220
+  Mirador project: Payments (proj_123)
+  Endpoint:        https://otel.mirador.org
+
+  Signals:
+    ✓ Agent traces
+    ✓ Structured events
+    ✓ Token and cost metrics
+
+    Prompts:      on
+    Tool content: on
+
+  This will update:
+    /Users/you/.claude/settings.json
+
+  A server key will be minted for this project — unless one is already installed here, which will be reused.
+
+Connect Claude Code to Mirador? [Y/n] y
+
+Connected. Restart Claude Code, then run a prompt.
+View traces with: mirador trace list --filter 'attribute.service.name="claude-code"'
+```
+
+### What gets sent
+
+**Everything, by default** — all three signals, plus prompt text, model responses, and
+tool input/output. That content is what makes an agent trace answer questions; a
+redacted trace mostly can't. It also means what you and the model said leaves the
+machine, so redaction is a flag away, and the two exclusions are independent:
+
+```bash
+mirador telemetry connect claude --exclude-prompts        # no prompt text or model responses
+mirador telemetry connect claude --exclude-tool-content   # no tool parameters, input, or output
+```
+
+With prompts excluded, Claude Code still reports prompt *length*, so you keep the shape
+of a session without its contents. Either way the connect plan prints the capture
+posture before asking for confirmation.
+
+Pick a subset of signals with `--signals`:
+
+```bash
+mirador telemetry connect claude --signals traces,logs
+```
+
+Other useful flags: `--key-name` to name the minted key, `--api-key` to install a key you
+already hold instead of minting one, and `-y` to skip the prompt.
+
+### Checking and undoing
+
+```bash
+mirador telemetry status              # every harness
+mirador telemetry status claude
+mirador telemetry disconnect claude
+```
+
+`status` reads the harness's own config, so it reports what the harness is set up to
+send — not whether anything has arrived. A harness exporting somewhere other than the
+active profile's endpoint is reported as `connected to <that endpoint> (this profile
+expects <yours>)` — the everyday case being a dev-connected harness read under the prod
+profile — so it is never mistaken for yours.
+
+`disconnect` restores exactly what connect changed: settings Mirador wrote go back to
+their prior values (a connect-time journal under `~/.mirador/telemetry/` records them),
+anything you edited since connecting is left alone and named, and Mirador's helper
+script is deleted along with its setting. The server key itself stays live, since it is
+bound to the project rather than to the machine — `disconnect` prints its masked prefix
+so you can find and revoke it in the web app.
+
+Minting a key needs a user credential, so `telemetry connect` requires `mirador login`;
+a `mir_srv_` key in `MIRADOR_API_KEY` cannot mint another. Use `--api-key` to install a
+key you already have.
+
+`codex` is listed and will report itself as not yet supported: it does not expose a
+stable set of OTLP environment variables to write.
 
 ## Filters and time windows
 
@@ -280,9 +387,13 @@ The CLI talks to three Mirador hosts, and knows which is which:
 
 | Host | Used for |
 |---|---|
-| `auth.mirador.org` | `login`, `logout`, token refresh, `project list`, `org list` |
+| `auth.mirador.org` | `login`, `logout`, token refresh, `project list`, `org list`, `telemetry connect` |
 | `api.mirador.org` | `trace`, `log`, `metric`, `dashboard`, `metric-alert`, `derived-metric` |
 | `app.mirador.org` | the browser page `login` opens |
+
+A fourth, `otel.mirador.org`, is where telemetry is ingested. The CLI never calls it —
+it writes that URL into an agent harness's configuration, and the harness exports there
+directly. Override it with `MIRADOR_OTLP_URL` or `mirador config set --otlp-url`.
 
 Credentials are minted on their own host so an auth outage cannot take reads down with it — the
 data API validates tokens directly against Redis and never calls the auth host per request.
@@ -296,6 +407,7 @@ Running a self-hosted deployment? Point the CLI at it with environment variables
 export MIRADOR_API_URL=https://api.example.com
 export MIRADOR_AUTH_URL=https://auth.example.com
 export MIRADOR_APP_URL=https://app.example.com
+export MIRADOR_OTLP_URL=https://otel.example.com
 ```
 
 Or store them on a profile so they persist and you can switch between deployments:
