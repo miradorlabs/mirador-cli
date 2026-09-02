@@ -523,9 +523,21 @@ func (c Claude) Connect(e Exporter, clearConflicts bool) error {
 	j := newJournal(c.Name(), path, s.env, env, cleared, clearedSettings, previousJournal)
 	for key, value := range settings {
 		j.InstalledSettings[key] = value
-		if prior := stringSetting(s.root, key); prior != "" {
-			prior := prior
-			j.PreviousSettings[key] = &prior
+		current := stringSetting(s.root, key)
+		// Ownership carries across a reconnect the way it does for env keys: while the
+		// file still holds what the earlier connect installed, the value to put back is
+		// the pre-Mirador one that connect recorded — not Mirador's own helper path,
+		// which a later disconnect would otherwise "restore", leaving the setting
+		// pointing at a script it had just deleted.
+		if previousJournal != nil {
+			if priorInstalled, owned := previousJournal.InstalledSettings[key]; owned && current == priorInstalled {
+				j.PreviousSettings[key] = cloneString(previousJournal.PreviousSettings[key])
+				continue
+			}
+		}
+		if current != "" {
+			current := current
+			j.PreviousSettings[key] = &current
 		} else {
 			j.PreviousSettings[key] = nil
 		}
