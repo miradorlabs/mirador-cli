@@ -123,6 +123,9 @@ var claudeManagedKeys = []string{
 func (Claude) Name() string        { return "claude" }
 func (Claude) DisplayName() string { return "Claude Code" }
 
+// SupportsHeadersHelper: the otelHeadersHelper setting, see helper.go.
+func (Claude) SupportsHeadersHelper() bool { return true }
+
 // claudeVersionRE pulls the semver out of `claude --version`, whose output is
 // "2.0.14 (Claude Code)". Matching loosely on the leading version keeps this working if
 // the parenthetical changes.

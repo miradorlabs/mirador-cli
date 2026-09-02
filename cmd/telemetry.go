@@ -67,12 +67,13 @@ func newTelemetryConnectCommand() *cobra.Command {
 		Long: `Mints a server key for the selected project and writes the harness's telemetry
 configuration.
 
-The key is created server-side and returned exactly once. By default it lands in a
-0700 helper script under ~/.mirador/helpers/ and the harness config gets only the
-script's path (Claude Code's otelHeadersHelper mechanism) — so the settings file
-never holds a credential and stays safe to share or keep in dotfiles. Pass
---inline-key to write the key into the settings file instead; that file is then
-tightened to 0600.
+The key is created server-side and returned exactly once. Where the harness can fetch
+its OTLP headers from a script at startup (Claude Code's otelHeadersHelper), the key
+lands in a 0700 helper script under ~/.mirador/helpers/ and the harness config gets
+only the script's path — so the settings file never holds a credential and stays safe
+to share or keep in dotfiles; pass --inline-key to write the key into the settings
+file instead. Codex has no such mechanism, so its key is always written into
+config.toml. Either way, a file that holds the key is tightened to 0600.
 
 Your existing settings are preserved — only Mirador's own keys are written, and
 ` + "`telemetry disconnect`" + ` removes exactly those. Reconnecting to the same project
@@ -91,7 +92,7 @@ key you already hold.`,
 	fl.StringVar(&f.keyName, "key-name", "", "name for the minted key (defaults to <harness>@<hostname>)")
 	fl.StringVar(&f.apiKey, "api-key", "", "install this existing mir_srv_ key instead of minting a new one")
 	fl.StringVar(&f.identity, "identity", "", "value for enduser.id (defaults to your global git email; \"none\" to omit)")
-	fl.BoolVar(&f.inlineKey, "inline-key", false, "store the key in the settings file instead of a Mirador headers-helper script")
+	fl.BoolVar(&f.inlineKey, "inline-key", false, "store the key in the settings file instead of a Mirador headers-helper script (Claude Code; Codex always stores it inline)")
 	fl.BoolVarP(&f.assumeYes, "yes", "y", false, "skip the confirmation prompt")
 	fl.BoolVar(&f.force, "force", false, "remove conflicting per-signal OTLP settings instead of refusing to connect")
 	return cmd
@@ -144,9 +145,10 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 		IncludePrompts:     !f.excludePrompts,
 		IncludeToolContent: !f.excludeToolContent,
 	}
-	// The default delivery: a Mirador-owned helper script supplies the Authorization
-	// header, so the harness's settings file never holds the key — only a path.
-	if !f.inlineKey {
+	// The default delivery, where the harness supports it: a Mirador-owned helper script
+	// supplies the Authorization header, so the harness's settings file never holds the
+	// key — only a path. A harness without the mechanism gets the key inline.
+	if !f.inlineKey && h.SupportsHeadersHelper() {
 		helperPath, err := harness.HelperFilePath(h, cfg.ProjectID)
 		if err != nil {
 			return err
@@ -159,15 +161,17 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 	}
 
 	printConnectPlan(out, h, cfg, detection, configPath, intended.HelperPath, signals, f)
+	printConnectNotes(out, h, intended)
 	printConflicts(out, conflicts, f.force)
 
-	// A conflict outside the user file — exported in the shell, or set in a project
-	// settings file that outranks it — cannot be cleared by writing to the user file, so
-	// --force must not pretend otherwise. Connecting anyway would install the credential
-	// while the override kept deciding where telemetry goes.
+	// A conflict Mirador does not change — exported in the shell, set in a project or
+	// managed file that outranks the user config, or a setting that is the user's own
+	// opt-out — cannot be cleared by writing to the user file, so --force must not
+	// pretend otherwise. Connecting anyway would install the credential while the
+	// override kept deciding where telemetry goes.
 	if blocking := unclearable(conflicts); len(blocking) > 0 {
 		return fmt.Errorf(
-			"%s reads these from outside your user settings, where Mirador cannot change them: %s — unset or remove them, then retry",
+			"%s has settings Mirador does not change: %s — remove or adjust them, then retry",
 			h.DisplayName(), strings.Join(blocking, ", "))
 	}
 	if len(conflicts) > 0 && !f.force {
@@ -268,6 +272,8 @@ func printConnectPlan(
 	fmt.Fprintf(out, "    %s\n", configPath)
 	if helperPath != "" {
 		fmt.Fprintf(out, "    %s  (holds the key; the settings file will not)\n", helperPath)
+	} else {
+		fmt.Fprintln(out, "    (the server key is written into this file, which is tightened to 0600)")
 	}
 	if f.apiKey == "" {
 		// Reuse is decided after the plan (it needs the config read that minting also
@@ -275,6 +281,28 @@ func printConnectPlan(
 		fmt.Fprintln(out, "\n  A server key will be minted for this project — unless one is already installed here, which will be reused.")
 	} else {
 		fmt.Fprintf(out, "\n  Installing the key you supplied (%s).\n", harness.MaskKey(f.apiKey))
+	}
+	fmt.Fprintln(out)
+}
+
+// printConnectNotes prints what a harness wants said about this particular connect —
+// a side effect of its own, or a limit of what its switches can do — before the user
+// is asked to confirm. Optional: most connects have nothing to add.
+func printConnectNotes(out io.Writer, h harness.Harness, e harness.Exporter) {
+	type noter interface {
+		ConnectNotes(e harness.Exporter) []string
+	}
+	n, ok := h.(noter)
+	if !ok {
+		return
+	}
+	notes := n.ConnectNotes(e)
+	if len(notes) == 0 {
+		return
+	}
+	fmt.Fprintln(out, "  Note:")
+	for _, note := range notes {
+		fmt.Fprintf(out, "    %s\n", output.SanitizeTerminal(note))
 	}
 	fmt.Fprintln(out)
 }
@@ -376,7 +404,11 @@ func printConflicts(out io.Writer, conflicts []harness.Conflict, force bool) {
 		if !c.Clearable {
 			// Say it here as well as in the error: this is the one the user has to go
 			// and fix themselves.
-			fmt.Fprintf(out, "       Mirador cannot change this — it is outside your user settings.\n")
+			if c.Scope == harness.ScopeUserSettings {
+				fmt.Fprintf(out, "       Mirador does not change this — it is your setting to remove.\n")
+			} else {
+				fmt.Fprintf(out, "       Mirador cannot change this — it is outside your user settings.\n")
+			}
 		}
 	}
 	fmt.Fprintln(out)
