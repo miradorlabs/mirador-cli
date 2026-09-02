@@ -75,8 +75,10 @@ func TestCodexRenderWritesOneExporterPerSignal(t *testing.T) {
 		"metrics_exporter": `{ otlp-http = { endpoint = "https://otel.mirador.org/v1/metrics", headers = { Authorization = "Bearer mir_srv_0123456789abcdef" }, protocol = "binary" } }`,
 		"log_user_prompt":  "false",
 		"tool_result":      "{ max_bytes = 0 }",
-		// service.name is Codex's own; only the attribution keys go on spans.
-		"span_attributes": `{ "enduser.id" = "dev@example.com", "mirador.project.id" = "proj_123" }`,
+		// service.name is Codex's own; only the attribution keys go on spans, and each
+		// is its own entry so the table's other attributes are never Mirador's.
+		"span_attributes/enduser.id":         `"dev@example.com"`,
+		"span_attributes/mirador.project.id": `"proj_123"`,
 	}
 	if !reflect.DeepEqual(env, want) {
 		t.Fatalf("Render() =\n%#v\nwant\n%#v", env, want)
@@ -170,6 +172,82 @@ command = "foo"
 	}
 	if shape := codexExporterOf(otel["exporter"]); shape.Kind != "otlp-http" {
 		t.Errorf("exporter = %v, want it replaced", otel["exporter"])
+	}
+}
+
+// span_attributes is the user's table as much as Mirador's. An attribute already in it
+// survives the connect alongside Mirador's two, and the disconnect gives back exactly
+// the original text.
+func TestCodexConnectPreservesCustomSpanAttributes(t *testing.T) {
+	const seed = "[otel]\nspan_attributes = { team = \"payments\" }\n"
+	c, path := codexIn(t, seed)
+	if err := c.Connect(codexExporter(), false); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	attrs, _ := otelOf(t, path)["span_attributes"].(map[string]any)
+	want := map[string]any{"team": "payments", "enduser.id": "dev@example.com", "mirador.project.id": "proj_123"}
+	if !reflect.DeepEqual(attrs, want) {
+		t.Fatalf("span_attributes = %v, want %v", attrs, want)
+	}
+	if _, err := c.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if got := readText(t, path); got != seed {
+		t.Fatalf("after disconnect:\n%s\nwant:\n%s", got, seed)
+	}
+}
+
+// An attribute added after the connect is the user's and stays; Mirador's own entries
+// are still recognized and removed, since ownership stops at the entry rather than at
+// the table.
+func TestCodexDisconnectRemovesOnlyItsOwnSpanAttributes(t *testing.T) {
+	c, path := codexIn(t, "")
+	if err := c.Connect(codexExporter(), false); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	edited := strings.Replace(readText(t, path), "span_attributes = { ", "span_attributes = { team = \"payments\", ", 1)
+	if err := os.WriteFile(path, []byte(edited), 0o600); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+
+	result, err := c.Disconnect()
+	if err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if len(result.Skipped) != 0 {
+		t.Errorf("skipped = %v, want nothing — the user's addition is not an edit of Mirador's entries", result.Skipped)
+	}
+	attrs, _ := otelOf(t, path)["span_attributes"].(map[string]any)
+	if !reflect.DeepEqual(attrs, map[string]any{"team": "payments"}) {
+		t.Fatalf("span_attributes = %v, want only the user's attribute left", attrs)
+	}
+	for _, key := range []string{"exporter", "log_user_prompt"} {
+		if _, ok := otelOf(t, path)[key]; ok {
+			t.Errorf("%s survived disconnect", key)
+		}
+	}
+}
+
+// Mirador overwrites an attribute of its own name that the user had set, and puts
+// the user's value back on disconnect.
+func TestCodexDisconnectRestoresOverwrittenSpanAttribute(t *testing.T) {
+	const seed = "[otel]\nspan_attributes = { \"enduser.id\" = \"someone@example.com\" }\n"
+	c, path := codexIn(t, seed)
+	if err := c.Connect(codexExporter(), false); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if got := codexSpanAttribute(otelOf(t, path), AttrEnduserID); got != "dev@example.com" {
+		t.Fatalf("enduser.id = %q after connect", got)
+	}
+	result, err := c.Disconnect()
+	if err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if result.Restored != 1 {
+		t.Errorf("restored = %d, want the user's enduser.id put back", result.Restored)
+	}
+	if got := readText(t, path); got != seed {
+		t.Fatalf("after disconnect:\n%s\nwant:\n%s", got, seed)
 	}
 }
 

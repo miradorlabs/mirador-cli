@@ -229,7 +229,9 @@ with literal header values, so the key is written there and the file is tightene
 `0600`. Only the `[otel]` table is rewritten: the rest of `config.toml` — comments,
 MCP servers, profiles, key order — is preserved byte for byte, and the result is
 re-parsed and checked before it is written. Keys inside `[otel]` that Mirador does not
-own (`environment`, for instance) survive too; comments inside that one table do not.
+own (`environment`, for instance) survive too, and so do your own entries in
+`span_attributes`: Mirador adds and later removes only its `enduser.id` and
+`mirador.project.id` there. Comments inside that one table do not survive.
 
 With Claude Code's enhanced telemetry on you get spans for each interaction, model
 request and retry, tool execution and subagent, plus structured events and metrics for

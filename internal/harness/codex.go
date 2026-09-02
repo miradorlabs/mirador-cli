@@ -58,7 +58,13 @@ const (
 	// codexSpanAttributes are stamped on every span, and only spans. It is the only
 	// per-user attribute Codex accepts: resource attributes are not configurable, so
 	// logs and metrics carry Codex's own service.name and env and nothing of Mirador's.
-	codexSpanAttributes = "span_attributes"
+	//
+	// The table may hold the user's own attributes too, so Mirador owns entries in it,
+	// never the table. In the flat view the journal works on, an entry is keyed
+	// `span_attributes/<attribute>`; the slash cannot appear in an otel key, so the
+	// first one splits the path unambiguously even for attributes that contain dots.
+	codexSpanAttributes      = "span_attributes"
+	codexSpanAttributePrefix = codexSpanAttributes + "/"
 
 	// The analytics opt-out is its own table, not an otel key. When `enabled` is false
 	// Codex installs no metrics exporter at all, whatever `metrics_exporter` says — the
@@ -160,7 +166,9 @@ func (Codex) ConfigPath() (string, error) {
 }
 
 // Render maps an Exporter onto the otel table. Values are TOML text — the canonical
-// rendering of each value, which is also the form the ownership journal records.
+// rendering of each value, which is also the form the ownership journal records. Span
+// attributes are rendered one entry at a time, as `span_attributes/<attribute>`, so a
+// connect adds Mirador's two to whatever the table already holds.
 //
 // Only the exporters for the selected signals are written. Codex's exporters are
 // self-contained, so an unselected signal is simply left as it was: for logs and traces
@@ -180,8 +188,8 @@ func (Codex) Render(e Exporter) map[string]string {
 	if !e.IncludeToolContent {
 		out[codexToolResult] = mustRenderTOML(map[string]any{codexToolResultMaxBytes: int64(0)})
 	}
-	if attrs := codexSpanAttributeValues(e.ResourceAttributes); len(attrs) > 0 {
-		out[codexSpanAttributes] = mustRenderTOML(attrs)
+	for key, value := range codexSpanAttributeValues(e.ResourceAttributes) {
+		out[codexSpanAttributePrefix+key] = mustRenderTOML(value)
 	}
 	return out
 }
@@ -315,12 +323,31 @@ func codexAnalyticsDisabled(doc map[string]any) bool {
 	return ok && !v
 }
 
-// canonicalOtel renders each key of the table as TOML text, the form the journal
-// compares and records. A value that cannot be rendered is reported rather than
-// dropped: silently losing it would make disconnect unable to restore it.
+// canonicalOtel renders the table as the flat view the journal works on: each key as
+// TOML text, except span_attributes, whose entries appear one by one under
+// `span_attributes/<attribute>` so that ownership can stop at the entry. A value that
+// cannot be rendered is reported rather than dropped: silently losing it would make
+// disconnect unable to restore it.
 func canonicalOtel(otel map[string]any) (map[string]string, error) {
 	out := make(map[string]string, len(otel))
 	for k, v := range otel {
+		if k == codexSpanAttributes {
+			attrs, ok := v.(map[string]any)
+			if !ok {
+				// Codex itself would refuse this file; say so rather than fold a
+				// scalar into a table it never was.
+				return nil, fmt.Errorf("%s.%s is %s, want a table (fix the file, then retry)",
+					otelTable, k, tomlTypeName(v))
+			}
+			for name, value := range attrs {
+				s, err := renderTOMLValue(value)
+				if err != nil {
+					return nil, fmt.Errorf("%s.%s.%s: %w", otelTable, k, name, err)
+				}
+				out[codexSpanAttributePrefix+name] = s
+			}
+			continue
+		}
 		s, err := renderTOMLValue(v)
 		if err != nil {
 			return nil, fmt.Errorf("%s.%s: %w", otelTable, k, err)
@@ -330,13 +357,23 @@ func canonicalOtel(otel map[string]any) (map[string]string, error) {
 	return out, nil
 }
 
-// otelFromCanonical is the inverse of canonicalOtel.
+// otelFromCanonical is the inverse of canonicalOtel. A span_attributes table with no
+// entries left is omitted rather than written empty.
 func otelFromCanonical(values map[string]string) (map[string]any, error) {
 	out := make(map[string]any, len(values))
 	for k, text := range values {
 		v, err := parseTOMLValue(text)
 		if err != nil {
 			return nil, fmt.Errorf("%s.%s: %w", otelTable, k, err)
+		}
+		if name, ok := strings.CutPrefix(k, codexSpanAttributePrefix); ok {
+			attrs, _ := out[codexSpanAttributes].(map[string]any)
+			if attrs == nil {
+				attrs = map[string]any{}
+				out[codexSpanAttributes] = attrs
+			}
+			attrs[name] = v
+			continue
 		}
 		out[k] = v
 	}
