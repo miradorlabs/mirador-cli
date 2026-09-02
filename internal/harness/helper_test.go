@@ -252,3 +252,36 @@ func TestConnectPrunesStaleJournals(t *testing.T) {
 		t.Fatalf("journal dir holds %v, want exactly the live config's record", names)
 	}
 }
+
+// A reconnect must not make Mirador's own helper path the "previous" value of the
+// setting: the later disconnect would then put it back, pointing Claude Code at a
+// script the same disconnect deleted. Found by the e2e suite (reconnect with a
+// different capture posture, then disconnect).
+func TestHelperSurvivesReconnectThenDisconnect(t *testing.T) {
+	c, path := claudeIn(t, `{"model":"opus"}`)
+	e := helperExporter(t)
+	if err := c.Connect(e, false); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	e.IncludePrompts = !e.IncludePrompts
+	if err := c.Connect(e, false); err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+
+	result, err := c.Disconnect()
+	if err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if got := readJSON(t, path); got["otelHeadersHelper"] != nil {
+		t.Fatalf("otelHeadersHelper = %v after disconnect, want it removed — it points at a deleted script", got["otelHeadersHelper"])
+	}
+	if _, err := os.Stat(e.HelperPath); !os.IsNotExist(err) {
+		t.Fatal("the helper script survived disconnect")
+	}
+	if len(result.Skipped) != 0 {
+		t.Errorf("skipped = %v, want nothing", result.Skipped)
+	}
+	if readJSON(t, path)["model"] != "opus" {
+		t.Error("an unrelated setting was lost")
+	}
+}
