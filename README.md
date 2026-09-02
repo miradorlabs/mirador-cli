@@ -204,12 +204,20 @@ work.
 mirador telemetry connect claude
 ```
 
-It mints a server key scoped to the selected project, then writes the OTLP endpoint and
-that key into the harness's own configuration — for Claude Code, the `env` block of
+It mints a server key scoped to the selected project — or, when this project already
+has one installed here, reuses it rather than minting an orphan — and writes the OTLP
+configuration into the harness's own settings: for Claude Code, the `env` block of
 `~/.claude/settings.json`. Nothing is added to your shell profile, and every other
-setting in that file is preserved. The file is tightened to `0600` afterwards, because
-it now holds a live credential, and a `.mirador.bak` copy of the original is written
+setting in that file is preserved; a `.mirador.bak` copy of the original is written
 alongside it.
+
+**The key itself never enters `settings.json`.** It lands in a `0700` helper script
+under `~/.mirador/helpers/`, and the settings file gets only the script's path via
+Claude Code's `otelHeadersHelper` mechanism — Claude runs the script to fetch the
+`Authorization` header at startup and refreshes it periodically. Your settings file
+therefore stays free of credentials: safe to diff, share, or keep in a dotfiles repo,
+at whatever permissions you had it. Prefer everything in one file? `--inline-key`
+writes the key into `settings.json` the classic way and tightens it to `0600`.
 
 With Claude Code's enhanced telemetry on you get spans for each interaction, model
 request and retry, tool execution and subagent, plus structured events and metrics for
@@ -225,13 +233,13 @@ Claude Code found: 2.1.220
     ✓ Structured events
     ✓ Token and cost metrics
 
-    Prompts:      off
-    Tool content: off
+    Prompts:      on
+    Tool content: on
 
   This will update:
     /Users/you/.claude/settings.json
 
-  A new server key will be minted for this project.
+  A server key will be minted for this project — unless one is already installed here, which will be reused.
 
 Connect Claude Code to Mirador? [Y/n] y
 
@@ -241,14 +249,19 @@ View traces with: mirador trace list --filter 'attribute.service.name="claude-co
 
 ### What gets sent
 
-**Prompts, model responses, and tool content are excluded by default.** Claude Code
-still reports prompt *length*, so you keep the shape of a session without its contents.
-Turning capture on is an explicit flag, and the two are independent:
+**Everything, by default** — all three signals, plus prompt text, model responses, and
+tool input/output. That content is what makes an agent trace answer questions; a
+redacted trace mostly can't. It also means what you and the model said leaves the
+machine, so redaction is a flag away, and the two exclusions are independent:
 
 ```bash
-mirador telemetry connect claude --include-prompts        # prompt text and model responses
-mirador telemetry connect claude --include-tool-content   # tool parameters, input, and output
+mirador telemetry connect claude --exclude-prompts        # no prompt text or model responses
+mirador telemetry connect claude --exclude-tool-content   # no tool parameters, input, or output
 ```
+
+With prompts excluded, Claude Code still reports prompt *length*, so you keep the shape
+of a session without its contents. Either way the connect plan prints the capture
+posture before asking for confirmation.
 
 Pick a subset of signals with `--signals`:
 
@@ -268,12 +281,17 @@ mirador telemetry disconnect claude
 ```
 
 `status` reads the harness's own config, so it reports what the harness is set up to
-send — not whether anything has arrived. It distinguishes `connected` from `connected
-elsewhere`, so a harness pointed at someone else's collector is never reported as yours.
+send — not whether anything has arrived. A harness exporting somewhere other than the
+active profile's endpoint is reported as `connected to <that endpoint> (this profile
+expects <yours>)` — the everyday case being a dev-connected harness read under the prod
+profile — so it is never mistaken for yours.
 
-`disconnect` removes exactly the settings Mirador wrote and leaves the rest alone. The
-server key stays live, since it is bound to the project rather than to the machine —
-`disconnect` prints its masked prefix so you can find and revoke it in the web app.
+`disconnect` restores exactly what connect changed: settings Mirador wrote go back to
+their prior values (a connect-time journal under `~/.mirador/telemetry/` records them),
+anything you edited since connecting is left alone and named, and Mirador's helper
+script is deleted along with its setting. The server key itself stays live, since it is
+bound to the project rather than to the machine — `disconnect` prints its masked prefix
+so you can find and revoke it in the web app.
 
 Minting a key needs a user credential, so `telemetry connect` requires `mirador login`;
 a `mir_srv_` key in `MIRADOR_API_KEY` cannot mint another. Use `--api-key` to install a

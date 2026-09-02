@@ -144,7 +144,7 @@ func TestConnectClearsBetaTracingPairWhenAsked(t *testing.T) {
 		"BETA_TRACING_ENDPOINT":"https://beta-collector.example.com"
 	}}`)
 
-	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+	if err := c.Connect(fullExporter(), true); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	env := envOf(t, path)
@@ -231,7 +231,7 @@ func TestBackupTracksTheLatestNonMiradorConfiguration(t *testing.T) {
 	if _, err := c.Backup(miradorEndpoint); err != nil {
 		t.Fatalf("Backup: %v", err)
 	}
-	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+	if err := c.Connect(fullExporter(), true); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if _, err := c.Disconnect(); err != nil {
@@ -268,7 +268,7 @@ func TestConnectLeavesConflictsAloneByDefault(t *testing.T) {
 		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":"https://other-collector.example.com"
 	}}`)
 
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if got := envOf(t, path)["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]; got != "https://other-collector.example.com" {
@@ -284,7 +284,7 @@ func TestConnectClearsConflictsWhenAsked(t *testing.T) {
 		"EDITOR":"vim"
 	}}`)
 
-	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+	if err := c.Connect(fullExporter(), true); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -311,7 +311,7 @@ func TestConnectClearsConflictsWhenAsked(t *testing.T) {
 // that signal somewhere else.
 func TestStatusReportsConflicts(t *testing.T) {
 	c, _ := claudeIn(t, "")
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -348,7 +348,7 @@ func TestBackupIsNotOverwrittenByAReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Backup: %v", err)
 	}
-	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+	if err := c.Connect(fullExporter(), true); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -395,7 +395,7 @@ func TestConnectWritesThroughASymlink(t *testing.T) {
 	}
 
 	c := Claude{}
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -430,7 +430,7 @@ func TestConnectWritesThroughASymlink(t *testing.T) {
 // config is not "connected", and disconnect keying off Connected would walk away from it.
 func TestStatusCountsManagedKeysWhenNotConnected(t *testing.T) {
 	c, _ := claudeIn(t, "")
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -505,7 +505,7 @@ func TestDisconnectRestoresPreviousValuesAndSkipsEdits(t *testing.T) {
 		"OTEL_LOG_USER_PROMPTS":"1"
 	}}`)
 
-	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+	if err := c.Connect(fullExporter(), true); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -555,7 +555,7 @@ func TestDisconnectRestoresClearedConflicts(t *testing.T) {
 		"env":{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":"https://other-collector.example.com"}
 	}`)
 
-	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+	if err := c.Connect(fullExporter(), true); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if _, ok := envOf(t, path)["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]; ok {
@@ -588,13 +588,13 @@ func TestReconnectPreservesOriginalJournal(t *testing.T) {
 
 	first := fullExporter()
 	first.APIKey = "mir_srv_first_credential"
-	if err := c.Connect(c.Render(first), true); err != nil {
+	if err := c.Connect(first, true); err != nil {
 		t.Fatalf("first Connect: %v", err)
 	}
 
 	second := fullExporter()
 	second.APIKey = "mir_srv_second_credential"
-	if err := c.Connect(c.Render(second), true); err != nil {
+	if err := c.Connect(second, true); err != nil {
 		t.Fatalf("second Connect: %v", err)
 	}
 
@@ -618,7 +618,7 @@ func TestReconnectPreservesOriginalJournal(t *testing.T) {
 // and a repeated disconnect cannot fall into the legacy name-based removal path.
 func TestRepeatedDisconnectKeepsEditedKeys(t *testing.T) {
 	c, path := claudeIn(t, `{}`)
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -668,7 +668,7 @@ func TestConnectDoesNotWriteSettingsWhenJournalCannotBeSaved(t *testing.T) {
 	}
 	t.Setenv("MIRADOR_CONFIG_DIR", blocked)
 
-	if err := c.Connect(c.Render(fullExporter()), false); err == nil {
+	if err := c.Connect(fullExporter(), false); err == nil {
 		t.Fatal("Connect succeeded without being able to save its ownership journal")
 	}
 	data, err := os.ReadFile(path)
@@ -682,7 +682,7 @@ func TestConnectDoesNotWriteSettingsWhenJournalCannotBeSaved(t *testing.T) {
 
 func TestDisconnectRefusesCorruptJournal(t *testing.T) {
 	c, path := claudeIn(t, `{}`)
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	journalFile, err := journalPath(c.Name(), path)
@@ -728,7 +728,7 @@ func TestConnectRefusesADanglingSymlink(t *testing.T) {
 	}
 
 	c := Claude{}
-	err := c.Connect(c.Render(fullExporter()), false)
+	err := c.Connect(fullExporter(), false)
 	if err == nil {
 		t.Fatal("Connect followed a dangling symlink")
 	}
@@ -768,7 +768,7 @@ func TestDisconnectKeepsASymlinkTargetAlive(t *testing.T) {
 	}
 
 	c := Claude{}
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if _, err := c.Disconnect(); err != nil {
@@ -899,7 +899,7 @@ func TestConnectClearsOtelHeadersHelperWhenAsked(t *testing.T) {
 	c, path := claudeIn(t, `{"model":"opus","otelHeadersHelper":"/usr/local/bin/headers.sh"}`)
 	t.Chdir(t.TempDir())
 
-	if err := c.Connect(c.Render(fullExporter()), true); err != nil {
+	if err := c.Connect(fullExporter(), true); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	doc := readJSON(t, path)
@@ -942,7 +942,7 @@ func TestJournalIsPerConfigNotPerHarness(t *testing.T) {
 
 	// Connect the "real" config.
 	t.Setenv("CLAUDE_CONFIG_DIR", realDir)
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("connect real: %v", err)
 	}
 
@@ -950,7 +950,7 @@ func TestJournalIsPerConfigNotPerHarness(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", sandboxDir)
 	sandbox := fullExporter()
 	sandbox.Endpoint = "https://otel-dev.mirador.org"
-	if err := c.Connect(c.Render(sandbox), false); err != nil {
+	if err := c.Connect(sandbox, false); err != nil {
 		t.Fatalf("connect sandbox: %v", err)
 	}
 

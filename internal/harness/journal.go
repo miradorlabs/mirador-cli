@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/miradorlabs/mirador-cli/internal/config"
 )
@@ -45,6 +46,11 @@ type journal struct {
 	// from Cleared matters: restoring a setting such as otelHeadersHelper inside `env`
 	// produces a different, invalid configuration.
 	ClearedSettings map[string]string `json:"cleared_settings,omitempty"`
+	// InstalledSettings / PreviousSettings mirror Installed / Previous for the top-level
+	// settings Mirador writes — today the otelHeadersHelper path. Same ownership rule:
+	// touched on disconnect only while still holding what Mirador wrote.
+	InstalledSettings map[string]string  `json:"installed_settings,omitempty"`
+	PreviousSettings  map[string]*string `json:"previous_settings,omitempty"`
 }
 
 // journalPath keys the record by the config file it describes, not by the harness alone.
@@ -105,6 +111,19 @@ func loadJournal(harness, configPath string) (*journal, error) {
 			return nil, fmt.Errorf("parse %s: missing previous value for %s (repair or remove it explicitly, then retry)", path, key)
 		}
 	}
+	// Older journals predate the settings maps; absent means "none installed", which
+	// initialized-empty expresses without failing the whole record.
+	if j.InstalledSettings == nil {
+		j.InstalledSettings = map[string]string{}
+	}
+	if j.PreviousSettings == nil {
+		j.PreviousSettings = map[string]*string{}
+	}
+	for key := range j.InstalledSettings {
+		if _, ok := j.PreviousSettings[key]; !ok {
+			return nil, fmt.Errorf("parse %s: missing previous value for setting %s (repair or remove it explicitly, then retry)", path, key)
+		}
+	}
 	return &j, nil
 }
 
@@ -146,12 +165,14 @@ func newJournal(
 	previous *journal,
 ) *journal {
 	j := &journal{
-		Harness:         harnessName,
-		ConfigPath:      configPath,
-		Installed:       make(map[string]string, len(installing)),
-		Previous:        make(map[string]*string, len(installing)),
-		Cleared:         map[string]string{},
-		ClearedSettings: map[string]string{},
+		Harness:           harnessName,
+		ConfigPath:        configPath,
+		Installed:         make(map[string]string, len(installing)),
+		Previous:          make(map[string]*string, len(installing)),
+		Cleared:           map[string]string{},
+		ClearedSettings:   map[string]string{},
+		InstalledSettings: map[string]string{},
+		PreviousSettings:  map[string]*string{},
 	}
 
 	// Carry keys from an earlier connect that this connect does not write. Render can
@@ -167,6 +188,13 @@ func newJournal(
 		}
 		maps.Copy(j.Cleared, previous.Cleared)
 		maps.Copy(j.ClearedSettings, previous.ClearedSettings)
+		// Settings ownership carries the same way env ownership does: the pre-Mirador
+		// value survives reconnects so the eventual disconnect restores it, not an
+		// intermediate Mirador state.
+		for key, installed := range previous.InstalledSettings {
+			j.InstalledSettings[key] = installed
+			j.PreviousSettings[key] = cloneString(previous.PreviousSettings[key])
+		}
 	}
 
 	for key, value := range installing {
@@ -219,12 +247,14 @@ func cloneString(value *string) *string {
 func (j *journal) apply(env map[string]string) (DisconnectResult, *journal) {
 	var result DisconnectResult
 	remaining := &journal{
-		Harness:         j.Harness,
-		ConfigPath:      j.ConfigPath,
-		Installed:       map[string]string{},
-		Previous:        map[string]*string{},
-		Cleared:         map[string]string{},
-		ClearedSettings: map[string]string{},
+		Harness:           j.Harness,
+		ConfigPath:        j.ConfigPath,
+		Installed:         map[string]string{},
+		Previous:          map[string]*string{},
+		Cleared:           map[string]string{},
+		ClearedSettings:   map[string]string{},
+		InstalledSettings: map[string]string{},
+		PreviousSettings:  map[string]*string{},
 	}
 
 	for key, installed := range j.Installed {
@@ -259,5 +289,43 @@ func (j *journal) apply(env map[string]string) (DisconnectResult, *journal) {
 }
 
 func (j *journal) empty() bool {
-	return len(j.Installed) == 0 && len(j.Cleared) == 0 && len(j.ClearedSettings) == 0
+	return len(j.Installed) == 0 && len(j.Cleared) == 0 && len(j.ClearedSettings) == 0 &&
+		len(j.InstalledSettings) == 0
+}
+
+// pruneJournals removes records whose config file no longer exists — a temp-dir
+// sandbox that was deleted, a CLAUDE_CONFIG_DIR that came and went. Best-effort by
+// design and called after successful connects and disconnects: a record that cannot be
+// pruned today is retried on the next lifecycle operation, and a prune failure must
+// never fail the operation that triggered it.
+func pruneJournals() {
+	dir, err := config.Dir()
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "telemetry"))
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, "telemetry", entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var record struct {
+			ConfigPath string `json:"config_path"`
+		}
+		if json.Unmarshal(data, &record) != nil || record.ConfigPath == "" {
+			// Unparseable records are left in place: deleting what cannot be read is how
+			// an ownership record for a live config gets lost.
+			continue
+		}
+		if _, err := os.Stat(record.ConfigPath); errors.Is(err, fs.ErrNotExist) {
+			_ = os.Remove(path)
+		}
+	}
 }

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,17 +42,17 @@ func TestTelemetryConnectFlags(t *testing.T) {
 		t.Fatalf("find: %v", err)
 	}
 
-	for _, name := range []string{"signals", "include-prompts", "include-tool-content", "key-name", "api-key", "yes"} {
+	for _, name := range []string{"signals", "exclude-prompts", "exclude-tool-content", "key-name", "api-key", "yes"} {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("`telemetry connect` has no --%s flag", name)
 		}
 	}
 
-	// The two content flags must default to off. This is the single most important
-	// default in the command.
-	for _, name := range []string{"include-prompts", "include-tool-content"} {
+	// Capture is the default; the exclusion flags default to false so a bare connect
+	// exports everything, and redaction is the explicit choice.
+	for _, name := range []string{"exclude-prompts", "exclude-tool-content"} {
 		if got := cmd.Flags().Lookup(name).DefValue; got != "false" {
-			t.Errorf("--%s defaults to %q, want false — content capture must be opt-in", name, got)
+			t.Errorf("--%s defaults to %q, want false — a bare connect captures content", name, got)
 		}
 	}
 }
@@ -381,5 +382,202 @@ func TestTelemetryConnectPrintsAUsableFilter(t *testing.T) {
 	}
 	if strings.Contains(got, `--filter 'service.name=`) {
 		t.Error("connect printed a bare service.name filter, which the trace grammar rejects")
+	}
+}
+
+// A bare connect captures everything: all three signals, prompt text, and tool
+// content. The exclusion flags are the redaction path, and each turns off only its
+// own capture.
+func TestTelemetryConnectCapturesContentByDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want map[string]string
+	}{
+		{
+			name: "bare connect",
+			want: map[string]string{
+				"OTEL_LOG_USER_PROMPTS":        "1",
+				"OTEL_LOG_ASSISTANT_RESPONSES": "1",
+				"OTEL_LOG_TOOL_DETAILS":        "1",
+				"OTEL_LOG_TOOL_CONTENT":        "1",
+				"OTEL_TRACES_EXPORTER":         "otlp",
+				"OTEL_LOGS_EXPORTER":           "otlp",
+				"OTEL_METRICS_EXPORTER":        "otlp",
+			},
+		},
+		{
+			name: "exclude prompts",
+			args: []string{"--exclude-prompts"},
+			want: map[string]string{
+				"OTEL_LOG_USER_PROMPTS":        "0",
+				"OTEL_LOG_ASSISTANT_RESPONSES": "0",
+				"OTEL_LOG_TOOL_DETAILS":        "1",
+				"OTEL_LOG_TOOL_CONTENT":        "1",
+			},
+		},
+		{
+			name: "exclude tool content",
+			args: []string{"--exclude-tool-content"},
+			want: map[string]string{
+				"OTEL_LOG_USER_PROMPTS":        "1",
+				"OTEL_LOG_ASSISTANT_RESPONSES": "1",
+				"OTEL_LOG_TOOL_DETAILS":        "0",
+				"OTEL_LOG_TOOL_CONTENT":        "0",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("CLAUDE_CONFIG_DIR", dir)
+			t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+
+			root := NewRootCommand()
+			root.SetOut(&bytes.Buffer{})
+			root.SetErr(&bytes.Buffer{})
+			root.SetArgs(append([]string{
+				"telemetry", "connect", "claude",
+				"--api-key", "mir_srv_test",
+				"--project", "770e8400-e29b-41d4-a716-446655440000",
+				"--yes",
+			}, tc.args...))
+			if err := root.Execute(); err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+
+			data, err := os.ReadFile(filepath.Join(dir, "settings.json"))
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			var doc struct {
+				Env map[string]string `json:"env"`
+			}
+			if err := json.Unmarshal(data, &doc); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			for key, want := range tc.want {
+				if got := doc.Env[key]; got != want {
+					t.Errorf("%s = %q, want %q", key, got, want)
+				}
+			}
+		})
+	}
+}
+
+// Reconnecting the same project must reuse the installed key rather than minting an
+// orphan. The proof is structural: the second connect has no --api-key and no stored
+// login, so if it tried to mint it would fail with "not logged in" — succeeding at all
+// means the key came from the existing config.
+func TestTelemetryReconnectReusesInstalledKey(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+
+	connect := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		root := NewRootCommand()
+		root.SetOut(&out)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(append([]string{
+			"telemetry", "connect", "claude",
+			"--project", "770e8400-e29b-41d4-a716-446655440000",
+			"--yes",
+		}, args...))
+		err := root.Execute()
+		return out.String(), err
+	}
+
+	if _, err := connect("--api-key", "mir_srv_0123456789abcdef"); err != nil {
+		t.Fatalf("first connect: %v", err)
+	}
+
+	// Same project, no key supplied, no login available — and different capture flags,
+	// because tweaking settings is exactly when accidental re-minting used to happen.
+	out, err := connect("--exclude-prompts")
+	if err != nil {
+		t.Fatalf("reconnect tried to mint instead of reusing: %v", err)
+	}
+	if !strings.Contains(out, "Reusing the key already configured") {
+		t.Errorf("reconnect did not report the reuse:\n%s", out)
+	}
+
+	h := harness.Claude{}
+	key, ok := h.CurrentCredential("https://otel.mirador.org", "770e8400-e29b-41d4-a716-446655440000")
+	if !ok || key != "mir_srv_0123456789abcdef" {
+		t.Fatalf("installed key after reconnect = (%q, %v), want the original", key, ok)
+	}
+}
+
+// --inline-key opts out of the helper: the key goes into the settings file, which is
+// then tightened, and no helper setting appears.
+func TestTelemetryInlineKeyFlag(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"telemetry", "connect", "claude",
+		"--api-key", "mir_srv_inline123",
+		"--project", "770e8400-e29b-41d4-a716-446655440000",
+		"--inline-key", "--yes",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "settings.json"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(data), "mir_srv_inline123") {
+		t.Fatal("--inline-key did not write the key into the settings file")
+	}
+	if strings.Contains(string(data), "otelHeadersHelper") {
+		t.Fatal("--inline-key still installed a headers helper")
+	}
+}
+
+// The default connect delivers the key through the helper: settings carry a path, the
+// key does not appear in them at all.
+func TestTelemetryDefaultConnectUsesHelper(t *testing.T) {
+	dir := t.TempDir()
+	miradorHome := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", miradorHome)
+
+	root := NewRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"telemetry", "connect", "claude",
+		"--api-key", "mir_srv_helperdefault1",
+		"--project", "770e8400-e29b-41d4-a716-446655440000",
+		"--yes",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "settings.json"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(string(data), "mir_srv_helperdefault1") {
+		t.Fatalf("the key landed in settings.json on a default connect:\n%s", data)
+	}
+	if !strings.Contains(string(data), "otelHeadersHelper") {
+		t.Fatalf("no helper was configured on a default connect:\n%s", data)
+	}
+	helper := filepath.Join(miradorHome, "helpers",
+		"claude-otel-770e8400-e29b-41d4-a716-446655440000")
+	script, err := os.ReadFile(helper)
+	if err != nil {
+		t.Fatalf("read helper: %v", err)
+	}
+	if !strings.Contains(string(script), "mir_srv_helperdefault1") {
+		t.Fatal("the helper script does not hold the key")
 	}
 }

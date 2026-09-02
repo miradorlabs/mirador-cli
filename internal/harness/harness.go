@@ -84,9 +84,18 @@ type Exporter struct {
 	// trace gets attributed to a person and a Mirador project.
 	ResourceAttributes map[string]string
 
-	// IncludePrompts and IncludeToolContent are opt-in, and default off. They are
-	// separate switches because they leak different things: prompts and responses are
-	// what the user and model said, tool content is what ran and what came back.
+	// HelperPath, when set, delivers the credential through the harness's headers-helper
+	// mechanism instead of an inline header: connect writes a 0700 script at this path
+	// that prints the Authorization header, and points the harness's otelHeadersHelper
+	// at it. The settings file then never holds the key — only a path — so it stays
+	// shareable, diffable, and safe in a dotfiles repo. Empty means inline delivery.
+	HelperPath string
+
+	// IncludePrompts and IncludeToolContent control content capture. They are separate
+	// switches because they disclose different things: prompts and responses are what
+	// the user and model said, tool content is what ran and what came back. The policy
+	// default (capture on, excluded by flag) belongs to the connect command; this struct
+	// just records what was decided, and its zero value captures nothing.
 	IncludePrompts     bool
 	IncludeToolContent bool
 }
@@ -256,10 +265,12 @@ type Harness interface {
 	// is irrelevant to a metrics-only connect.
 	ConflictsWith(e Exporter) ([]Conflict, error)
 
-	// Connect merges env into the config, preserving every setting it does not own.
-	// Conflicting overrides are removed only when clearConflicts is set, which the
-	// caller gates behind an explicit flag: they are the user's settings, not Mirador's.
-	Connect(env map[string]string, clearConflicts bool) error
+	// Connect installs the exporter: renders it, merges the result into the config, and
+	// (in helper mode) writes the credential script — preserving every setting it does
+	// not own. Conflicting overrides are removed only when clearConflicts is set, which
+	// the caller gates behind an explicit flag: they are the user's settings, not
+	// Mirador's.
+	Connect(e Exporter, clearConflicts bool) error
 
 	// Disconnect undoes a connect: keys Mirador installed and that still hold the value
 	// it wrote are restored to what they were before, and keys somebody has since

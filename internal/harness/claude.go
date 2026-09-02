@@ -196,7 +196,9 @@ func (Claude) Render(e Exporter) map[string]string {
 		env[claudeEnhancedTelemetry] = "1"
 	}
 
-	if e.APIKey != "" {
+	// In helper mode the credential travels through the headers-helper script instead;
+	// writing it here too would defeat the point of keeping it out of the settings file.
+	if e.APIKey != "" && e.HelperPath == "" {
 		env[otelHeaders] = "Authorization=Bearer " + e.APIKey
 	}
 	if attrs := e.ResourceAttributesValue(); attrs != "" {
@@ -269,6 +271,13 @@ func (c Claude) Status() (Status, error) {
 	}
 
 	status.KeyPrefix = maskKeyFromHeaders(s.env[otelHeaders])
+	// Helper mode keeps the key out of the settings file entirely; the prefix worth
+	// reporting then lives in the helper script.
+	if status.KeyPrefix == "" {
+		if helper := stringSetting(s.root, claudeOtelHeadersHelper); helper != "" && isOwnHelper(helper) {
+			status.KeyPrefix = MaskKey(keyFromHelper(helper))
+		}
+	}
 	status.ProjectID = resourceAttribute(s.env[otelResourceAttributes], AttrProjectID)
 
 	// With a journal, ownership is value-based: a key edited since connect is the user's
@@ -281,6 +290,11 @@ func (c Claude) Status() (Status, error) {
 	if j != nil {
 		for key, installed := range j.Installed {
 			if current, ok := s.env[key]; ok && current == installed {
+				status.ManagedKeys++
+			}
+		}
+		for key, installed := range j.InstalledSettings {
+			if stringSetting(s.root, key) == installed {
 				status.ManagedKeys++
 			}
 		}
@@ -324,8 +338,9 @@ func (c Claude) ConflictsWith(e Exporter) ([]Conflict, error) {
 func claudeConflicts(env map[string]string, root map[string]json.RawMessage, e Exporter) []Conflict {
 	var out []Conflict
 
-	// Not an env entry, so nothing above would find it.
-	if helper := stringSetting(root, claudeOtelHeadersHelper); helper != "" {
+	// Not an env entry, so nothing above would find it. Mirador's own helper is exempt:
+	// it is the credential delivery this connect manages, not a foreign override.
+	if helper := stringSetting(root, claudeOtelHeadersHelper); helper != "" && !isOwnHelper(helper) {
 		out = append(out, Conflict{
 			Key:        claudeOtelHeadersHelper,
 			Value:      helper,
@@ -443,7 +458,15 @@ func stringSetting(root map[string]json.RawMessage, key string) string {
 // clearConflicts removes the per-signal overrides reported by ConflictsWith. Without it
 // they are left alone, which is why the caller must refuse to connect while any remain:
 // writing the credential and leaving the override in place is the leak.
-func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
+func (c Claude) Connect(e Exporter, clearConflicts bool) error {
+	env := c.Render(e)
+	// The top-level settings this connect owns, alongside the env block. Today that is
+	// only the headers helper; recorded in the journal the same way env keys are.
+	settings := map[string]string{}
+	if e.HelperPath != "" {
+		settings[claudeOtelHeadersHelper] = e.HelperPath
+	}
+
 	path, err := c.ConfigPath()
 	if err != nil {
 		return err
@@ -460,7 +483,7 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 	cleared := map[string]string{}
 	clearedSettings := map[string]string{}
 	if clearConflicts {
-		for _, conflict := range claudeConflicts(s.env, s.root, exporterFromEnv(env)) {
+		for _, conflict := range claudeConflicts(s.env, s.root, e) {
 			// Only this file's settings are Mirador's to touch. A shell export or a
 			// project file is somebody else's, and the caller refuses the connect rather
 			// than pretending --force dealt with it.
@@ -495,6 +518,24 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 	// Recorded before the merge overwrites anything, so disconnect can put the previous
 	// values back rather than inferring which keys were Mirador's.
 	j := newJournal(c.Name(), path, s.env, env, cleared, clearedSettings, previousJournal)
+	for key, value := range settings {
+		j.InstalledSettings[key] = value
+		if prior := stringSetting(s.root, key); prior != "" {
+			prior := prior
+			j.PreviousSettings[key] = &prior
+		} else {
+			j.PreviousSettings[key] = nil
+		}
+	}
+
+	// The helper script goes down first: the settings file about to be written points
+	// at it, and a harness starting between the two writes must find the credential
+	// already there. Idempotent, so a re-run after a crash converges.
+	if e.HelperPath != "" {
+		if err := writeHelper(e.HelperPath, e.APIKey); err != nil {
+			return err
+		}
+	}
 
 	// Persist ownership first. If this fails, the credential-bearing settings have not
 	// changed. A crash after this point but before the settings write leaves a harmless
@@ -503,8 +544,18 @@ func (c Claude) Connect(env map[string]string, clearConflicts bool) error {
 		return err
 	}
 	s.merge(env)
-	// tighten: the merged env carries the server key.
-	if err := s.save(true); err != nil {
+	for key, value := range settings {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		s.root[key] = encoded
+	}
+	// tighten only when the merged env carries the server key inline. In helper mode
+	// the settings file holds a path, not a secret, so the user's own mode survives —
+	// including a dotfiles-friendly 0644.
+	defer pruneJournals()
+	if err := s.save(e.HelperPath == ""); err != nil {
 		// Put the preceding journal back so a failed reconnect does not replace the
 		// ownership record for the still-current installation.
 		var rollbackErr error
@@ -550,6 +601,36 @@ func (c Claude) Disconnect() (DisconnectResult, error) {
 	// journal is by construction the right one.
 	case j != nil:
 		result, remaining = j.apply(s.env)
+		// Top-level settings Mirador installed: same ownership rule as env keys. The
+		// helper file itself goes with its setting — it holds the credential, and a
+		// disconnect that left it behind would strand a live key on disk.
+		for key, installed := range j.InstalledSettings {
+			current := stringSetting(s.root, key)
+			if current != installed {
+				if current != "" {
+					result.Skipped = append(result.Skipped, key)
+					remaining.InstalledSettings[key] = installed
+					remaining.PreviousSettings[key] = cloneString(j.PreviousSettings[key])
+				}
+				continue
+			}
+			if key == claudeOtelHeadersHelper && isOwnHelper(installed) {
+				if err := deleteHelper(installed); err != nil {
+					return result, err
+				}
+			}
+			if prior := j.PreviousSettings[key]; prior != nil {
+				encoded, err := json.Marshal(*prior)
+				if err != nil {
+					return result, err
+				}
+				s.root[key] = encoded
+				result.Restored++
+			} else {
+				delete(s.root, key)
+				result.Removed++
+			}
+		}
 		for key, value := range j.ClearedSettings {
 			if _, taken := s.root[key]; taken {
 				result.Skipped = append(result.Skipped, key)
@@ -570,6 +651,7 @@ func (c Claude) Disconnect() (DisconnectResult, error) {
 	}
 
 	sort.Strings(result.Skipped)
+	defer pruneJournals()
 	if result.Removed > 0 || result.Restored > 0 {
 		// The credential is gone, so there is nothing left to tighten for.
 		if err := s.save(false); err != nil {
@@ -667,20 +749,59 @@ func withoutSignal(signals []Signal, drop Signal) []Signal {
 	return out
 }
 
-// maskKeyFromHeaders extracts the key from an OTEL_EXPORTER_OTLP_HEADERS value and
-// returns only its head. The full key is never returned: status output lands in
-// terminals, screenshots, and bug reports.
-func maskKeyFromHeaders(headers string) string {
+// keyFromHeaders extracts the raw key from an OTEL_EXPORTER_OTLP_HEADERS value, or ""
+// when none is configured. Callers that display it must mask it; the raw form exists
+// for reuse, where handing back a masked key would mint an orphan instead.
+func keyFromHeaders(headers string) string {
 	for pair := range strings.SplitSeq(headers, ",") {
 		name, value, found := strings.Cut(pair, "=")
 		if !found || !strings.EqualFold(strings.TrimSpace(name), "Authorization") {
 			continue
 		}
 		key := strings.TrimSpace(value)
-		key = strings.TrimSpace(strings.TrimPrefix(key, "Bearer"))
-		return MaskKey(key)
+		return strings.TrimSpace(strings.TrimPrefix(key, "Bearer"))
 	}
 	return ""
+}
+
+// CurrentCredential returns the key this config already presents to endpoint for
+// projectID, whichever way it is delivered — helper script or inline header. It is the
+// reuse path: a reconnect that minted a fresh key every time would leave a trail of
+// live orphans nobody remembers, and the key already here is exactly as scoped as the
+// one a mint would produce. Both endpoint and project must match: a key for another
+// project would be rejected server-side, and one for another deployment would be
+// disclosed to it.
+func (c Claude) CurrentCredential(endpoint, projectID string) (string, bool) {
+	path, err := c.ConfigPath()
+	if err != nil {
+		return "", false
+	}
+	s, err := loadSettings(path)
+	if err != nil {
+		return "", false
+	}
+	if s.env[otelEndpoint] != endpoint {
+		return "", false
+	}
+	if resourceAttribute(s.env[otelResourceAttributes], AttrProjectID) != projectID {
+		return "", false
+	}
+	if helper := stringSetting(s.root, claudeOtelHeadersHelper); helper != "" && isOwnHelper(helper) {
+		if key := keyFromHelper(helper); key != "" {
+			return key, true
+		}
+	}
+	if key := keyFromHeaders(s.env[otelHeaders]); strings.HasPrefix(key, "mir_srv_") {
+		return key, true
+	}
+	return "", false
+}
+
+// maskKeyFromHeaders extracts the key from an OTEL_EXPORTER_OTLP_HEADERS value and
+// returns only its head. The full key is never returned: status output lands in
+// terminals, screenshots, and bug reports.
+func maskKeyFromHeaders(headers string) string {
+	return MaskKey(keyFromHeaders(headers))
 }
 
 // MaskKey renders a credential as a recognizable but unusable prefix.

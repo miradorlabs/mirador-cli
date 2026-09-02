@@ -149,7 +149,7 @@ func TestConnectPreservesUnrelatedSettings(t *testing.T) {
   "env": {"EDITOR": "vim", "OTEL_LOG_USER_PROMPTS": "1"}
 }`)
 
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -182,7 +182,7 @@ func TestConnectPreservesUnrelatedSettings(t *testing.T) {
 func TestConnectCreatesFileWhenAbsent(t *testing.T) {
 	c, path := claudeIn(t, "")
 
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if envOf(t, path)["CLAUDE_CODE_ENABLE_TELEMETRY"] != "1" {
@@ -198,7 +198,7 @@ func TestConnectTightensFilePermissions(t *testing.T) {
 	}
 	c, path := claudeIn(t, `{"model":"opus"}`)
 
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	info, err := os.Stat(path)
@@ -216,7 +216,7 @@ func TestConnectRefusesMalformedSettings(t *testing.T) {
 	const original = `{"model": "opus",,,`
 	c, path := claudeIn(t, original)
 
-	if err := c.Connect(c.Render(fullExporter()), false); err == nil {
+	if err := c.Connect(fullExporter(), false); err == nil {
 		t.Fatal("Connect succeeded against an unparseable settings file")
 	}
 	data, err := os.ReadFile(path)
@@ -231,7 +231,7 @@ func TestConnectRefusesMalformedSettings(t *testing.T) {
 func TestDisconnectRemovesOnlyManagedKeys(t *testing.T) {
 	c, path := claudeIn(t, `{"model":"opus","env":{"EDITOR":"vim","MY_VAR":"keep"}}`)
 
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	result, err := c.Disconnect()
@@ -263,7 +263,7 @@ func TestDisconnectRemovesOnlyManagedKeys(t *testing.T) {
 func TestDisconnectRestoresAnUntouchedFile(t *testing.T) {
 	c, path := claudeIn(t, `{"model":"opus"}`)
 
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if _, err := c.Disconnect(); err != nil {
@@ -304,7 +304,7 @@ func TestStatusRoundTrip(t *testing.T) {
 
 	e := fullExporter()
 	e.IncludeToolContent = true
-	if err := c.Connect(c.Render(e), false); err != nil {
+	if err := c.Connect(e, false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -364,7 +364,7 @@ func TestStatusNeverReturnsTheWholeKey(t *testing.T) {
 
 	e := fullExporter()
 	e.APIKey = key
-	if err := c.Connect(c.Render(e), false); err != nil {
+	if err := c.Connect(e, false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -490,7 +490,7 @@ func TestBackupCopiesTheOriginal(t *testing.T) {
 	}
 
 	// Connecting afterwards must not disturb the backup.
-	if err := c.Connect(c.Render(fullExporter()), false); err != nil {
+	if err := c.Connect(fullExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if again, _ := os.ReadFile(backup); string(again) != original {

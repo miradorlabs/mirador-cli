@@ -30,9 +30,10 @@ Connecting mints a server key scoped to one project and writes it, along with th
 OTLP endpoint, into the harness's own configuration. Nothing is added to your shell
 profile, and no other setting in that file is touched.
 
-Prompts, model responses, and tool content are excluded by default. Turning them on
-is an explicit flag, because it sends what you and the model said — and what your
-tools read and wrote — off this machine.
+Everything is captured by default — traces, events, metrics, prompt text, model
+responses, and tool input/output. That content is what makes an agent trace worth
+reading, but it does mean what you and the model said leaves this machine; pass
+--exclude-prompts or --exclude-tool-content to keep either out of the export.
 
 Supported: ` + strings.Join(harness.Names(), ", ") + `.`,
 	}
@@ -41,12 +42,18 @@ Supported: ` + strings.Join(harness.Names(), ", ") + `.`,
 }
 
 type connectFlags struct {
-	signals            string
-	includePrompts     bool
-	includeToolContent bool
+	signals string
+	// The content switches are spelled as exclusions because capture is the default:
+	// the point of connecting an agent harness is to see what the agent did, and a
+	// trace with the prompt and tool activity redacted answers almost none of the
+	// questions that send someone to it. The flags exist for the environments where
+	// that content must not leave the machine.
+	excludePrompts     bool
+	excludeToolContent bool
 	keyName            string
 	apiKey             string
 	identity           string
+	inlineKey          bool
 	assumeYes          bool
 	force              bool
 }
@@ -60,12 +67,17 @@ func newTelemetryConnectCommand() *cobra.Command {
 		Long: `Mints a server key for the selected project and writes the harness's telemetry
 configuration.
 
-The key is created server-side and returned exactly once; it goes straight into the
-harness config, and the file is tightened to 0600 because it now holds a credential.
-Your existing settings in that file are preserved — only Mirador's own keys are
-written, and ` + "`telemetry disconnect`" + ` removes exactly those.
+The key is created server-side and returned exactly once. By default it lands in a
+0700 helper script under ~/.mirador/helpers/ and the harness config gets only the
+script's path (Claude Code's otelHeadersHelper mechanism) — so the settings file
+never holds a credential and stays safe to share or keep in dotfiles. Pass
+--inline-key to write the key into the settings file instead; that file is then
+tightened to 0600.
 
-Pass --api-key to install a key you already hold instead of minting a new one.`,
+Your existing settings are preserved — only Mirador's own keys are written, and
+` + "`telemetry disconnect`" + ` removes exactly those. Reconnecting to the same project
+reuses the key already installed rather than minting another; --api-key installs a
+key you already hold.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runTelemetryConnect(cmd, args[0], f)
@@ -74,11 +86,12 @@ Pass --api-key to install a key you already hold instead of minting a new one.`,
 
 	fl := cmd.Flags()
 	fl.StringVar(&f.signals, "signals", "", "comma-separated signals to export: traces, logs, metrics (default all)")
-	fl.BoolVar(&f.includePrompts, "include-prompts", false, "also export prompt text and model responses")
-	fl.BoolVar(&f.includeToolContent, "include-tool-content", false, "also export tool parameters, input, and output")
+	fl.BoolVar(&f.excludePrompts, "exclude-prompts", false, "do not export prompt text or model responses")
+	fl.BoolVar(&f.excludeToolContent, "exclude-tool-content", false, "do not export tool parameters, input, or output")
 	fl.StringVar(&f.keyName, "key-name", "", "name for the minted key (defaults to <harness>@<hostname>)")
 	fl.StringVar(&f.apiKey, "api-key", "", "install this existing mir_srv_ key instead of minting a new one")
 	fl.StringVar(&f.identity, "identity", "", "value for enduser.id (defaults to your global git email; \"none\" to omit)")
+	fl.BoolVar(&f.inlineKey, "inline-key", false, "store the key in the settings file instead of a Mirador headers-helper script")
 	fl.BoolVarP(&f.assumeYes, "yes", "y", false, "skip the confirmation prompt")
 	fl.BoolVar(&f.force, "force", false, "remove conflicting per-signal OTLP settings instead of refusing to connect")
 	return cmd
@@ -128,15 +141,24 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 		Endpoint:           cfg.OTLPURL,
 		Signals:            signals,
 		ResourceAttributes: resourceAttributes(ctx, h, cfg, f.identity),
-		IncludePrompts:     f.includePrompts,
-		IncludeToolContent: f.includeToolContent,
+		IncludePrompts:     !f.excludePrompts,
+		IncludeToolContent: !f.excludeToolContent,
+	}
+	// The default delivery: a Mirador-owned helper script supplies the Authorization
+	// header, so the harness's settings file never holds the key — only a path.
+	if !f.inlineKey {
+		helperPath, err := harness.HelperFilePath(h, cfg.ProjectID)
+		if err != nil {
+			return err
+		}
+		intended.HelperPath = helperPath
 	}
 	conflicts, err := h.ConflictsWith(intended)
 	if err != nil {
 		return err
 	}
 
-	printConnectPlan(out, h, cfg, detection, configPath, signals, f)
+	printConnectPlan(out, h, cfg, detection, configPath, intended.HelperPath, signals, f)
 	printConflicts(out, conflicts, f.force)
 
 	// A conflict outside the user file — exported in the shell, or set in a project
@@ -165,9 +187,12 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 		}
 	}
 
-	key, keyMeta, minted, err := resolveKey(ctx, cfg, h, f)
+	key, keyMeta, minted, reused, err := resolveKey(ctx, cfg, h, f)
 	if err != nil {
 		return err
+	}
+	if reused {
+		fmt.Fprintf(out, "\nReusing the key already configured for this project (%s) — nothing new minted.\n", keyMeta.KeyPrefix)
 	}
 
 	// Back up before the merge. Best-effort: a user who asked to connect should not be
@@ -179,7 +204,7 @@ func runTelemetryConnect(cmd *cobra.Command, name string, f connectFlags) error 
 	}
 
 	intended.APIKey = key
-	if err := h.Connect(h.Render(intended), f.force); err != nil {
+	if err := h.Connect(intended, f.force); err != nil {
 		// Only when this invocation created it. A key supplied with --api-key already
 		// existed and is still perfectly good, so telling the user to go revoke it would
 		// send them to destroy a working credential over an unrelated write failure.
@@ -209,7 +234,7 @@ func printConnectPlan(
 	h harness.Harness,
 	cfg *config.Config,
 	detection harness.Detection,
-	configPath string,
+	configPath, helperPath string,
 	signals []harness.Signal,
 	f connectFlags,
 ) {
@@ -236,13 +261,18 @@ func printConnectPlan(
 	}
 
 	fmt.Fprintln(out)
-	fmt.Fprintf(out, "    Prompts:      %s\n", onOff(f.includePrompts))
-	fmt.Fprintf(out, "    Tool content: %s\n", onOff(f.includeToolContent))
+	fmt.Fprintf(out, "    Prompts:      %s\n", onOff(!f.excludePrompts))
+	fmt.Fprintf(out, "    Tool content: %s\n", onOff(!f.excludeToolContent))
 
 	fmt.Fprintln(out, "\n  This will update:")
 	fmt.Fprintf(out, "    %s\n", configPath)
+	if helperPath != "" {
+		fmt.Fprintf(out, "    %s  (holds the key; the settings file will not)\n", helperPath)
+	}
 	if f.apiKey == "" {
-		fmt.Fprintln(out, "\n  A new server key will be minted for this project.")
+		// Reuse is decided after the plan (it needs the config read that minting also
+		// waits on), so the plan states the rule rather than predicting the branch.
+		fmt.Fprintln(out, "\n  A server key will be minted for this project — unless one is already installed here, which will be reused.")
 	} else {
 		fmt.Fprintf(out, "\n  Installing the key you supplied (%s).\n", harness.MaskKey(f.apiKey))
 	}
@@ -252,12 +282,27 @@ func printConnectPlan(
 // resolveKey either installs a key the caller already holds or mints a new one. The
 // bool reports which happened, because only a key this invocation created is the
 // caller's to clean up if a later step fails.
-func resolveKey(ctx context.Context, cfg *config.Config, h harness.Harness, f connectFlags) (string, api.ServerKey, bool, error) {
+func resolveKey(ctx context.Context, cfg *config.Config, h harness.Harness, f connectFlags) (key string, meta api.ServerKey, minted, reused bool, err error) {
 	if key := strings.TrimSpace(f.apiKey); key != "" {
 		if !strings.HasPrefix(key, "mir_srv_") {
-			return "", api.ServerKey{}, false, errors.New("--api-key expects a mir_srv_ server key")
+			return "", api.ServerKey{}, false, false, errors.New("--api-key expects a mir_srv_ server key")
 		}
-		return key, api.ServerKey{KeyPrefix: harness.MaskKey(key)}, false, nil
+		return key, api.ServerKey{KeyPrefix: harness.MaskKey(key)}, false, false, nil
+	}
+
+	// Reconnects reuse the key already installed for this exact endpoint and project.
+	// Minting on every settings tweak — flipping a capture flag, changing signals —
+	// would leave a trail of live orphaned keys that nobody remembers and nothing
+	// cleans up; the key already here is exactly as scoped as the one a mint would
+	// produce. A different project or endpoint falls through to a fresh mint, because
+	// reusing across either boundary would be wrong, not just untidy.
+	type credentialed interface {
+		CurrentCredential(endpoint, projectID string) (string, bool)
+	}
+	if cur, ok := h.(credentialed); ok {
+		if existing, ok := cur.CurrentCredential(cfg.OTLPURL, cfg.ProjectID); ok {
+			return existing, api.ServerKey{KeyPrefix: harness.MaskKey(existing)}, false, true, nil
+		}
 	}
 
 	name := strings.TrimSpace(f.keyName)
@@ -267,14 +312,14 @@ func resolveKey(ctx context.Context, cfg *config.Config, h harness.Harness, f co
 
 	client, err := newClient(cfg)
 	if err != nil {
-		return "", api.ServerKey{}, false, err
+		return "", api.ServerKey{}, false, false, err
 	}
-	key, meta, err := client.CreateServerKey(ctx, cfg.ProjectID, name,
+	key, meta, err = client.CreateServerKey(ctx, cfg.ProjectID, name,
 		"Created by mirador telemetry connect "+h.Name())
 	if err != nil {
-		return "", api.ServerKey{}, false, err
+		return "", api.ServerKey{}, false, false, err
 	}
-	return key, meta, true, nil
+	return key, meta, true, false, nil
 }
 
 // resourceAttributes are stamped on everything the harness emits.
@@ -483,9 +528,14 @@ func describeStatus(ctx context.Context, h harness.Harness, cfg *config.Config) 
 		// endpoint column alone would be a lie.
 		entry.State = "connected, overridden"
 	case st.Endpoint != cfg.OTLPURL:
-		// Telemetry is on, but aimed somewhere else. Saying "connected" here would be
-		// wrong in the way that costs the most time to discover.
-		entry.State = "connected elsewhere"
+		// Telemetry is on, but aimed somewhere other than this profile's endpoint.
+		// Saying "connected" would be wrong in the way that costs the most time to
+		// discover — and naming only the state would leave the reader diffing JSON to
+		// learn *where*. Both endpoints in one line: the harness's actual destination,
+		// and the one the active profile expected. A dev-connected harness read under
+		// the prod profile is the everyday way to land here.
+		entry.State = fmt.Sprintf("connected to %s (this profile expects %s)",
+			output.SanitizeTerminal(st.Endpoint), output.SanitizeTerminal(cfg.OTLPURL))
 	default:
 		entry.State = "connected"
 	}
