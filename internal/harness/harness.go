@@ -190,9 +190,12 @@ const (
 	ScopeUserSettings = "user settings"
 	ScopeEnvironment  = "shell environment"
 	ScopeProject      = "project settings"
-	// ScopeManaged is an administrator-managed file that outranks everything the user
-	// writes — Codex's /etc/codex/managed_config.toml.
+	// ScopeManaged is an administrator-managed layer that outranks everything the user
+	// writes — Codex's /etc/codex/managed_config.toml, or its macOS managed preference.
 	ScopeManaged = "managed settings"
+	// ScopeProfile is a Codex profile file, `<name>.config.toml`, applied over the user
+	// config while that profile is selected.
+	ScopeProfile = "profile settings"
 )
 
 // DisconnectResult reports what a disconnect actually did. Removed and Restored are

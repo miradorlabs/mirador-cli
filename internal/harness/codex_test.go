@@ -358,7 +358,7 @@ func TestCodexStatusNeverReturnsTheWholeKey(t *testing.T) {
 // A metrics exporter is set but analytics are off: Codex installs no metrics exporter at
 // all. Reporting metrics as on would send someone hunting for data never sent.
 func TestCodexStatusDropsMetricsWhenAnalyticsDisabled(t *testing.T) {
-	c, _ := codexIn(t, "analytics_enabled = false\n")
+	c, _ := codexIn(t, "[analytics]\nenabled = false\n")
 	if err := c.Connect(codexExporter(), false); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -369,8 +369,8 @@ func TestCodexStatusDropsMetricsWhenAnalyticsDisabled(t *testing.T) {
 	if !reflect.DeepEqual(st.Signals, []Signal{SignalTraces, SignalLogs}) {
 		t.Errorf("signals = %v, want metrics dropped", st.Signals)
 	}
-	if len(st.Conflicts) != 1 || st.Conflicts[0].Key != "analytics_enabled" {
-		t.Errorf("conflicts = %+v, want analytics_enabled named", st.Conflicts)
+	if len(st.Conflicts) != 1 || st.Conflicts[0].Key != "analytics.enabled" {
+		t.Errorf("conflicts = %+v, want analytics.enabled named", st.Conflicts)
 	}
 }
 
@@ -433,16 +433,26 @@ func TestCodexConflictsReportForeignExporter(t *testing.T) {
 	})
 }
 
-// analytics_enabled = false is the user's opt-out from OpenAI's analytics as well as the
-// metrics switch. Mirador refuses the metrics signal rather than flipping it.
+// `[analytics] enabled = false` is the user's opt-out from OpenAI's analytics as well as
+// the metrics switch. Mirador refuses the metrics signal rather than flipping it.
 func TestCodexConflictsReportAnalyticsOptOut(t *testing.T) {
-	c, _ := codexIn(t, "analytics_enabled = false\n")
+	c, _ := codexIn(t, "[analytics]\nenabled = false\n")
 	conflicts, err := c.ConflictsWith(miradorExporter())
 	if err != nil {
 		t.Fatalf("ConflictsWith: %v", err)
 	}
-	if len(conflicts) != 1 || conflicts[0].Key != "analytics_enabled" || conflicts[0].Clearable {
-		t.Fatalf("got %+v, want analytics_enabled reported as unclearable", conflicts)
+	if len(conflicts) != 1 || conflicts[0].Key != "analytics.enabled" || conflicts[0].Clearable {
+		t.Fatalf("got %+v, want analytics.enabled reported as unclearable", conflicts)
+	}
+	// The key this replaced never existed in Codex; a config using it opts out of
+	// nothing, and must not be treated as if it did.
+	c, _ = codexIn(t, "analytics_enabled = false\n")
+	conflicts, err = c.ConflictsWith(miradorExporter())
+	if err != nil {
+		t.Fatalf("ConflictsWith: %v", err)
+	}
+	if len(conflicts) != 0 {
+		t.Fatalf("got %+v, want none for a key Codex does not read", conflicts)
 	}
 	conflicts, err = c.ConflictsWith(Exporter{Endpoint: miradorEndpoint, Signals: []Signal{SignalTraces, SignalLogs}})
 	if err != nil {
@@ -453,32 +463,116 @@ func TestCodexConflictsReportAnalyticsOptOut(t *testing.T) {
 	}
 }
 
-// A project's .codex/config.toml outranks the user config; an exporter there decides
-// the signal's destination and Mirador cannot change it.
-func TestCodexConflictsReportProjectConfig(t *testing.T) {
+// Codex refuses `otel` from project-local config — repository contents do not get to
+// choose where credentials go — so an exporter in .codex/config.toml is inert and must
+// not block a connect.
+func TestCodexIgnoresProjectConfig(t *testing.T) {
 	c, _ := codexIn(t, "")
 	repo := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+	for _, dir := range []string{".git", ".codex"} {
+		if err := os.MkdirAll(filepath.Join(repo, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".codex", "config.toml"),
+		[]byte("[otel]\nexporter = { otlp-http = { endpoint = \"https://other.example.com/v1/logs\", protocol = \"binary\" } }\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(repo, ".codex"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, ".codex", "config.toml"), []byte("[otel]\nexporter = \"none\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	sub := filepath.Join(repo, "pkg")
-	if err := os.MkdirAll(sub, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Chdir(sub)
+	t.Chdir(repo)
 
 	conflicts, err := c.ConflictsWith(miradorExporter())
 	if err != nil {
 		t.Fatalf("ConflictsWith: %v", err)
 	}
-	if len(conflicts) != 1 || conflicts[0].Scope != ScopeProject || conflicts[0].Clearable {
-		t.Fatalf("got %+v, want the project exporter reported as unclearable", conflicts)
+	if len(conflicts) != 0 {
+		t.Fatalf("got %+v, want none — Codex does not read otel from project config", conflicts)
+	}
+}
+
+// A profile file beside config.toml is applied over it whenever that profile is
+// selected, and can carry its own exporters. Mirador cannot know which profile a
+// session will use, so any of them counts, and the conflict names the file.
+func TestCodexConflictsReportProfileFiles(t *testing.T) {
+	c, path := codexIn(t, "")
+	profile := filepath.Join(filepath.Dir(path), "work.config.toml")
+	if err := os.WriteFile(profile, []byte("model = \"gpt-5\"\n\n[otel]\nexporter = \"none\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	conflicts, err := c.ConflictsWith(miradorExporter())
+	if err != nil {
+		t.Fatalf("ConflictsWith: %v", err)
+	}
+	if len(conflicts) != 1 || conflicts[0].Scope != ScopeProfile || conflicts[0].Clearable {
+		t.Fatalf("got %+v, want the profile exporter reported as unclearable", conflicts)
+	}
+	if !strings.Contains(conflicts[0].Key, "work.config.toml") || !strings.Contains(conflicts[0].Reason, "--profile work") {
+		t.Errorf("conflict %+v does not name the profile", conflicts[0])
+	}
+	// A profile that sets no exporter for a selected signal is no conflict at all.
+	if err := os.WriteFile(profile, []byte("model = \"gpt-5\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if conflicts, _ := c.ConflictsWith(miradorExporter()); len(conflicts) != 0 {
+		t.Fatalf("got %+v, want none", conflicts)
+	}
+}
+
+// Managed layers are read the same way; the file itself cannot be written in a test,
+// so the parser is exercised directly. An explicit "none" counts: it decides the
+// signal's destination just as surely as an endpoint does.
+func TestCodexConflictsInManagedLayer(t *testing.T) {
+	data := []byte("[otel]\nexporter = \"none\"\ntrace_exporter = { otlp-grpc = { endpoint = \"https://collector.example.com:4317\" } }\n")
+	conflicts := codexConflictsInLayer(data, "/etc/codex/managed_config.toml", ScopeManaged, "managed", miradorExporter())
+	if len(conflicts) != 2 {
+		t.Fatalf("got %+v, want both managed exporters reported", conflicts)
+	}
+	for _, c := range conflicts {
+		if c.Clearable || c.Scope != ScopeManaged || !strings.HasPrefix(c.Key, "/etc/codex/managed_config.toml:otel.") {
+			t.Errorf("conflict %+v is not reported as an unclearable managed setting", c)
+		}
+	}
+	if conflicts := codexConflictsInLayer(data, "x", ScopeManaged, "managed", Exporter{Endpoint: miradorEndpoint, Signals: []Signal{SignalMetrics}}); len(conflicts) != 0 {
+		t.Fatalf("got %+v, want none for a signal Mirador is not exporting", conflicts)
+	}
+}
+
+// No released build ever wrote a Codex config without a journal, so a config without
+// one is somebody else's — here, a company collector with its own bearer token.
+// Nothing in it is Mirador's to count, name, or remove.
+func TestCodexWithoutJournalTouchesNothing(t *testing.T) {
+	const seed = `[otel]
+environment = "prod"
+exporter = { otlp-http = { endpoint = "https://collector.example.com/v1/logs", protocol = "binary", headers = { Authorization = "Bearer company-secret-token" } } }
+log_user_prompt = true
+tool_result = { max_bytes = 4096 }
+span_attributes = { team = "payments" }
+`
+	c, path := codexIn(t, seed)
+
+	st, err := c.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.ManagedKeys != 0 {
+		t.Errorf("managed keys = %d, want none counted in a config Mirador never wrote", st.ManagedKeys)
+	}
+	if st.KeyPrefix != "" {
+		t.Errorf("key prefix = %q, want a foreign credential left unmentioned", st.KeyPrefix)
+	}
+	if !st.Connected || st.Endpoint != "https://collector.example.com" {
+		t.Errorf("connected=%v endpoint=%q, want the foreign export still described", st.Connected, st.Endpoint)
+	}
+
+	result, err := c.Disconnect()
+	if err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if result.Removed != 0 || result.Restored != 0 {
+		t.Errorf("disconnect changed %d keys in a config Mirador never wrote", result.Removed+result.Restored)
+	}
+	if got := readText(t, path); got != seed {
+		t.Fatalf("the foreign config was modified:\n%s", got)
 	}
 }
 

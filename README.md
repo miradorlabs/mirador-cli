@@ -308,10 +308,10 @@ mirador telemetry connect codex --signals traces,logs
 For Codex, signals you leave out are left exactly as they were rather than switched off:
 by default that is off for logs and traces, and OpenAI's own `statsig` route for
 metrics. Connecting the metrics signal replaces that route with Mirador — the plan notes
-it — and disconnecting puts it back. If `config.toml` has `analytics_enabled = false`,
-Codex exports no metrics at all whatever the exporter says, so a connect that includes
-metrics refuses rather than report a signal that would never arrive; connect with
-`--signals traces,logs`, or remove the setting.
+it — and disconnecting puts it back. If `config.toml` opts out of analytics
+(`[analytics]` with `enabled = false`), Codex exports no metrics at all whatever the
+exporter says, so a connect that includes metrics refuses rather than report a signal
+that would never arrive; connect with `--signals traces,logs`, or remove the setting.
 
 Other useful flags: `--key-name` to name the minted key, `--api-key` to install a key you
 already hold instead of minting one, and `-y` to skip the prompt.
@@ -337,12 +337,21 @@ script is deleted along with its setting. The server key itself stays live, sinc
 bound to the project rather than to the machine — `disconnect` prints its masked prefix
 so you can find and revoke it in the web app.
 
-Both harnesses layer settings from other places over the user file Mirador writes:
-Claude Code from project `.claude/settings.json` files and the shell environment, Codex
-from a project's `.codex/config.toml` and `/etc/codex/managed_config.toml`. A telemetry
-setting found there is reported as a conflict Mirador cannot clear, and connect refuses
-until it is removed. The scan covers the directory you run `connect` from; a harness
-started elsewhere may see different project settings.
+Both harnesses layer settings from other places over the user file Mirador writes.
+Claude Code reads project `.claude/settings.json` files and the shell environment; the
+scan covers the directory you run `connect` from, so a session started elsewhere may
+see different project settings. Codex applies an administrator's
+`/etc/codex/managed_config.toml` (macOS and Linux) or, on macOS, the
+`com.openai.codex` managed preference an MDM profile delivers, and a profile file
+(`<name>.config.toml` beside `config.toml`) whenever that profile is selected with
+`--profile`. Codex deliberately ignores `otel` in a project's `.codex/config.toml`, so
+that is neither honoured nor scanned. A telemetry setting found in a layer that outranks
+the user file is reported as a conflict Mirador cannot clear, and connect refuses until
+it is removed.
+
+`disconnect codex` acts only on what its own journal records. No earlier release wrote
+a Codex config, so a `[otel]` table without a journal is somebody else's — a company
+collector, say — and is neither counted, described by key prefix, nor removed.
 
 Minting a key needs a user credential, so `telemetry connect` requires `mirador login`;
 a `mir_srv_` key in `MIRADOR_API_KEY` cannot mint another. Use `--api-key` to install a

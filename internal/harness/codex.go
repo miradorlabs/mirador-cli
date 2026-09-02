@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"maps"
 	"os"
@@ -58,10 +59,11 @@ const (
 	// logs and metrics carry Codex's own service.name and env and nothing of Mirador's.
 	codexSpanAttributes = "span_attributes"
 
-	// codexAnalyticsEnabled is a top-level key, not an otel one. When it is false Codex
-	// installs no metrics exporter at all, whatever `metrics_exporter` says — the one
-	// way a metrics connect can look right and send nothing.
-	codexAnalyticsEnabled = "analytics_enabled"
+	// The analytics opt-out is its own table, not an otel key. When `enabled` is false
+	// Codex installs no metrics exporter at all, whatever `metrics_exporter` says — the
+	// one way a metrics connect can look right and send nothing.
+	codexAnalyticsTable      = "analytics"
+	codexAnalyticsEnabledKey = "enabled"
 
 	codexExporterNone     = "none"
 	codexExporterStatsig  = "statsig"
@@ -79,9 +81,18 @@ const (
 	// codexServiceName is the originator the codex CLI stamps as service.name.
 	codexServiceName = "codex_cli_rs"
 
-	codexConfigFile        = "config.toml"
-	codexProjectConfigDir  = ".codex"
-	codexManagedConfigUnix = "/etc/codex/managed_config.toml"
+	codexConfigFile = "config.toml"
+	// codexProfileSuffix names the profile files under CODEX_HOME: `<name>.config.toml`,
+	// layered over config.toml while that profile is selected with --profile.
+	codexProfileSuffix = ".config.toml"
+
+	// The administrator-managed layers, which outrank everything the user writes. The
+	// file is read on macOS and Linux; the managed preference is macOS-only and is what
+	// an MDM profile delivers, as a base64-encoded config.toml. Windows has neither:
+	// Codex 0.152 ignores a managed_config.toml there and says so at startup.
+	codexManagedConfigUnix       = "/etc/codex/managed_config.toml"
+	codexManagedPreferenceDomain = "com.openai.codex"
+	codexManagedPreferenceKey    = "config_toml_base64"
 )
 
 // codexSignalKeys maps each signal to its exporter key, in report order.
@@ -92,18 +103,6 @@ var codexSignalKeys = []struct {
 	{SignalTraces, codexTraceExporter},
 	{SignalLogs, codexLogExporter},
 	{SignalMetrics, codexMetricsExporter},
-}
-
-// codexManagedKeys is every otel key Mirador may write, and therefore what a disconnect
-// without a journal removes. `environment` and `tracestate` are deliberately absent:
-// Mirador never sets them.
-var codexManagedKeys = []string{
-	codexLogExporter,
-	codexTraceExporter,
-	codexMetricsExporter,
-	codexLogUserPrompt,
-	codexToolResult,
-	codexSpanAttributes,
 }
 
 func (Codex) Name() string        { return "codex" }
@@ -310,7 +309,8 @@ func codexToolContentOn(otel map[string]any) bool {
 }
 
 func codexAnalyticsDisabled(doc map[string]any) bool {
-	v, ok := doc[codexAnalyticsEnabled].(bool)
+	table, _ := doc[codexAnalyticsTable].(map[string]any)
+	v, ok := table[codexAnalyticsEnabledKey].(bool)
 	return ok && !v
 }
 
@@ -375,8 +375,10 @@ func (c Codex) Status() (Status, error) {
 		}
 		if codexMiradorExporter(f.otel[sk.key], status.Endpoint, sk.signal) {
 			status.Signals = append(status.Signals, sk.signal)
-			if status.KeyPrefix == "" {
-				status.KeyPrefix = MaskKey(codexKeyFromExporter(f.otel[sk.key]))
+			// Only a Mirador key is worth naming. The exporter may carry somebody
+			// else's bearer token, and even its head has no business in a status line.
+			if key := codexKeyFromExporter(f.otel[sk.key]); status.KeyPrefix == "" && strings.HasPrefix(key, "mir_srv_") {
+				status.KeyPrefix = MaskKey(key)
 			}
 		}
 	}
@@ -395,25 +397,22 @@ func (c Codex) Status() (Status, error) {
 		status.Signals = withoutSignal(status.Signals, SignalMetrics)
 	}
 
-	// Ownership is by value where a journal exists; the name-based count is the
-	// fallback for a config without one.
+	// Ownership is by journal only. There is no name-based fallback here, unlike
+	// Claude's: no released build ever wrote a Codex config without a journal, so a
+	// config with none is somebody else's work — a company collector, say — and every
+	// standard otel key in it is theirs. Counting those as managed would let disconnect
+	// delete a telemetry setup Mirador never touched.
 	j, err := loadJournal(c.Name(), path)
 	if err != nil {
 		return Status{}, err
 	}
-	current, err := canonicalOtel(f.otel)
-	if err != nil {
-		return Status{}, err
-	}
 	if j != nil {
+		current, err := canonicalOtel(f.otel)
+		if err != nil {
+			return Status{}, err
+		}
 		for key, installed := range j.Installed {
 			if current[key] == installed {
-				status.ManagedKeys++
-			}
-		}
-	} else {
-		for _, key := range codexManagedKeys {
-			if _, ok := f.otel[key]; ok {
 				status.ManagedKeys++
 			}
 		}
@@ -489,7 +488,7 @@ func codexConflicts(f *tomlFile, e Exporter) []Conflict {
 	// analytics as well as the metrics switch. Refuse the metrics signal instead.
 	if e.HasSignal(SignalMetrics) && codexAnalyticsDisabled(f.doc) {
 		out = append(out, Conflict{
-			Key:   codexAnalyticsEnabled,
+			Key:   codexAnalyticsTable + "." + codexAnalyticsEnabledKey,
 			Value: "false",
 			Reason: "Codex sends no metrics at all while analytics are disabled, so the metrics signal " +
 				"would connect and deliver nothing — remove this setting, or connect with --signals traces,logs",
@@ -499,56 +498,86 @@ func codexConflicts(f *tomlFile, e Exporter) []Conflict {
 	}
 
 	out = append(out, codexManagedConflicts(e)...)
-	out = append(out, codexProjectConflicts(e)...)
+	out = append(out, codexProfileConflicts(e)...)
 	return out
 }
 
-// codexManagedConflicts reports exporters set in the administrator-managed file, which
-// outranks the user config. Unix only: Codex ignores the file on Windows.
+// codexManagedConflicts reports exporters set by an administrator, in the layers that
+// outrank the user config: /etc/codex/managed_config.toml on macOS and Linux, and on
+// macOS the managed preference an MDM profile delivers. A project's .codex/config.toml
+// is deliberately not scanned: Codex refuses `otel` from project-local config, so a
+// setting there is inert and must not block a connect.
 func codexManagedConflicts(e Exporter) []Conflict {
-	if runtime.GOOS == "windows" {
-		return nil
+	var out []Conflict
+	if runtime.GOOS != "windows" {
+		if data, err := os.ReadFile(codexManagedConfigUnix); err == nil {
+			out = append(out, codexConflictsInLayer(data, codexManagedConfigUnix, ScopeManaged,
+				"set in "+codexManagedConfigUnix+", which Codex applies over your user config", e)...)
+		}
 	}
-	return codexConflictsInLayer(codexManagedConfigUnix, ScopeManaged,
-		"set in "+codexManagedConfigUnix+", which Codex applies over your user config", e)
+	if runtime.GOOS == "darwin" {
+		if data, ok := codexManagedPreference(); ok {
+			source := codexManagedPreferenceDomain + ":" + codexManagedPreferenceKey
+			out = append(out, codexConflictsInLayer(data, source, ScopeManaged,
+				"set by the managed preference "+source+", which Codex applies over your user config", e)...)
+		}
+	}
+	return out
 }
 
-// codexProjectConflicts reports exporters set in a project's .codex/config.toml, which
-// Codex layers over the user config for a trusted project. Walks up from the working
-// directory to the repository root, as the Claude scan does; Codex may later run
-// elsewhere, with other project settings, and that is stated in the docs rather than
-// papered over here.
-func codexProjectConflicts(e Exporter) []Conflict {
-	dir, err := os.Getwd()
+// codexManagedPreference reads the MDM-delivered config through `defaults`, which
+// consults the same managed-preferences domain Codex does. Absent is the ordinary case.
+func codexManagedPreference() ([]byte, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "defaults", "read", codexManagedPreferenceDomain, codexManagedPreferenceKey).Output()
+	if err != nil {
+		return nil, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
+	if err != nil {
+		return nil, false
+	}
+	return decoded, true
+}
+
+// codexProfileConflicts reports exporters set in a profile file — `<name>.config.toml`
+// beside config.toml — which is layered over the user config whenever that profile is
+// selected with --profile. Which profile a session will use is not knowable here, so
+// every profile is scanned; the reason names the one at fault.
+func codexProfileConflicts(e Exporter) []Conflict {
+	home, err := codexHome()
+	if err != nil {
+		return nil
+	}
+	entries, err := os.ReadDir(home)
 	if err != nil {
 		return nil
 	}
 	var out []Conflict
-	for {
-		path := filepath.Join(dir, codexProjectConfigDir, codexConfigFile)
-		out = append(out, codexConflictsInLayer(path, ScopeProject,
-			"set in "+path+", which Codex applies over your user config", e)...)
-		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			break
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, codexProfileSuffix) || name == codexConfigFile {
+			continue
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
+		profile := strings.TrimSuffix(name, codexProfileSuffix)
+		path := filepath.Join(home, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
 		}
-		dir = parent
+		out = append(out, codexConflictsInLayer(data, name, ScopeProfile,
+			"set in "+path+", which Codex applies over your user config whenever that profile is selected with --profile "+profile, e)...)
 	}
 	return out
 }
 
 // codexConflictsInLayer reports any exporter for a selected signal in a higher-
-// precedence file. Any value counts, including an explicit "none": a layer above the
-// user config decides the signal's destination, and the user-level exporter Mirador
-// writes would never be consulted.
-func codexConflictsInLayer(path, scope, reason string, e Exporter) []Conflict {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
+// precedence layer. Any value counts, including an explicit "none": that layer decides
+// the signal's destination, and the user-level exporter Mirador writes would never be
+// consulted. Keys are qualified by their source, so a status report cannot mistake
+// them for settings in the user config.
+func codexConflictsInLayer(data []byte, source, scope, reason string, e Exporter) []Conflict {
 	var doc struct {
 		Otel map[string]any `toml:"otel"`
 	}
@@ -573,7 +602,7 @@ func codexConflictsInLayer(path, scope, reason string, e Exporter) []Conflict {
 			value = shape.Kind
 		}
 		out = append(out, Conflict{
-			Key:       otelTable + "." + sk.key,
+			Key:       source + ":" + otelTable + "." + sk.key,
 			Value:     value,
 			Reason:    reason,
 			Scope:     scope,
@@ -702,19 +731,12 @@ func (c Codex) Disconnect() (DisconnectResult, error) {
 		return DisconnectResult{}, err
 	}
 
-	var result DisconnectResult
-	var remaining *journal
-	if j != nil {
-		result, remaining = j.apply(current)
-	} else {
-		for _, key := range codexManagedKeys {
-			if _, ok := current[key]; ok {
-				delete(current, key)
-				result.Removed++
-			}
-		}
-		result.Unjournaled = true
+	// Without a journal there is nothing here that Mirador wrote — see Status — so
+	// there is nothing to undo, and certainly not a foreign telemetry setup to delete.
+	if j == nil {
+		return DisconnectResult{}, nil
 	}
+	result, remaining := j.apply(current)
 	sort.Strings(result.Skipped)
 
 	defer pruneJournals()
@@ -728,9 +750,6 @@ func (c Codex) Disconnect() (DisconnectResult, error) {
 		}
 	}
 
-	if j == nil {
-		return result, nil
-	}
 	if remaining != nil && !remaining.empty() {
 		return result, remaining.save()
 	}
@@ -764,9 +783,6 @@ func (c Codex) Backup(endpoint string) (string, error) {
 	}
 	return f.backup(!pointsAtMirador)
 }
-
-// ManagedKeys is what a journal-less Disconnect would remove, for a preview.
-func (Codex) ManagedKeys() []string { return codexManagedKeys }
 
 // ConnectNotes are the two things a Codex connect does, or cannot do, that the plan's
 // generic lines do not say: connecting metrics takes them away from OpenAI's own

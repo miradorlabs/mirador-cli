@@ -268,7 +268,7 @@ func TestTelemetryCodexRefusesMetricsWhenAnalyticsDisabled(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", dir)
 	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
-	const seed = "analytics_enabled = false\n"
+	const seed = "[analytics]\nenabled = false\n"
 	path := filepath.Join(dir, "config.toml")
 	if err := os.WriteFile(path, []byte(seed), 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -290,8 +290,8 @@ func TestTelemetryCodexRefusesMetricsWhenAnalyticsDisabled(t *testing.T) {
 	}
 
 	out, err := connect()
-	if err == nil || !strings.Contains(err.Error(), "analytics_enabled") {
-		t.Fatalf("connect error = %v, want analytics_enabled named", err)
+	if err == nil || !strings.Contains(err.Error(), "analytics.enabled") {
+		t.Fatalf("connect error = %v, want analytics.enabled named", err)
 	}
 	if !strings.Contains(out, "--signals traces,logs") {
 		t.Errorf("the conflict did not point at the way out:\n%s", out)
