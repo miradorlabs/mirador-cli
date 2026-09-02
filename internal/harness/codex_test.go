@@ -489,9 +489,10 @@ func TestCodexIgnoresProjectConfig(t *testing.T) {
 	}
 }
 
-// A profile file beside config.toml is applied over it whenever that profile is
+// A profile file beside config.toml is applied over it only while that profile is
 // selected, and can carry its own exporters. Mirador cannot know which profile a
-// session will use, so any of them counts, and the conflict names the file.
+// session will use, so every one is reported — as advisory, naming the file — rather
+// than allowed to block the connect that the plain configuration asked for.
 func TestCodexConflictsReportProfileFiles(t *testing.T) {
 	c, path := codexIn(t, "")
 	profile := filepath.Join(filepath.Dir(path), "work.config.toml")
@@ -503,8 +504,8 @@ func TestCodexConflictsReportProfileFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConflictsWith: %v", err)
 	}
-	if len(conflicts) != 1 || conflicts[0].Scope != ScopeProfile || conflicts[0].Clearable {
-		t.Fatalf("got %+v, want the profile exporter reported as unclearable", conflicts)
+	if len(conflicts) != 1 || conflicts[0].Scope != ScopeProfile || conflicts[0].Clearable || !conflicts[0].Advisory {
+		t.Fatalf("got %+v, want the profile exporter reported as advisory", conflicts)
 	}
 	if !strings.Contains(conflicts[0].Key, "work.config.toml") || !strings.Contains(conflicts[0].Reason, "--profile work") {
 		t.Errorf("conflict %+v does not name the profile", conflicts[0])
@@ -522,18 +523,73 @@ func TestCodexConflictsReportProfileFiles(t *testing.T) {
 // so the parser is exercised directly. An explicit "none" counts: it decides the
 // signal's destination just as surely as an endpoint does.
 func TestCodexConflictsInManagedLayer(t *testing.T) {
+	layer := codexLayer{source: "/etc/codex/managed_config.toml", scope: ScopeManaged, where: "managed"}
 	data := []byte("[otel]\nexporter = \"none\"\ntrace_exporter = { otlp-grpc = { endpoint = \"https://collector.example.com:4317\" } }\n")
-	conflicts := codexConflictsInLayer(data, "/etc/codex/managed_config.toml", ScopeManaged, "managed", miradorExporter())
+	conflicts := codexConflictsInLayer(data, layer, miradorExporter())
 	if len(conflicts) != 2 {
 		t.Fatalf("got %+v, want both managed exporters reported", conflicts)
 	}
 	for _, c := range conflicts {
-		if c.Clearable || c.Scope != ScopeManaged || !strings.HasPrefix(c.Key, "/etc/codex/managed_config.toml:otel.") {
-			t.Errorf("conflict %+v is not reported as an unclearable managed setting", c)
+		if c.Clearable || c.Advisory || c.Scope != ScopeManaged || !strings.HasPrefix(c.Key, "/etc/codex/managed_config.toml:otel.") {
+			t.Errorf("conflict %+v is not reported as a blocking managed setting", c)
 		}
 	}
-	if conflicts := codexConflictsInLayer(data, "x", ScopeManaged, "managed", Exporter{Endpoint: miradorEndpoint, Signals: []Signal{SignalMetrics}}); len(conflicts) != 0 {
+	if conflicts := codexConflictsInLayer(data, layer, Exporter{Endpoint: miradorEndpoint, Signals: []Signal{SignalMetrics}}); len(conflicts) != 0 {
 		t.Fatalf("got %+v, want none for a signal Mirador is not exporting", conflicts)
+	}
+	// The same destination named in a higher layer changes nothing.
+	same := []byte("[otel]\nexporter = { otlp-http = { endpoint = \"" + miradorEndpoint + "/v1/logs\", protocol = \"binary\" } }\n")
+	if conflicts := codexConflictsInLayer(same, layer, miradorExporter()); len(conflicts) != 0 {
+		t.Fatalf("got %+v, want none for Mirador's own endpoint", conflicts)
+	}
+}
+
+// The privacy posture the plan promises can be overturned by a higher layer without
+// any exporter changing hands: the content switches, the attribution, and the analytics
+// opt-out all merge over the user config key by key. Each is checked against what
+// Mirador is about to write, and reported only when it contradicts it.
+func TestCodexConflictsInLayerCoverPrivacySettings(t *testing.T) {
+	layer := codexLayer{source: "work.config.toml", scope: ScopeProfile, where: "profile", advisory: true}
+	data := []byte(`[analytics]
+enabled = false
+
+[otel]
+log_user_prompt = true
+tool_result = { max_bytes = 2048 }
+span_attributes = { "mirador.project.id" = "proj_other", team = "payments" }
+`)
+
+	redacted := Exporter{
+		Endpoint: miradorEndpoint, Signals: AllSignals,
+		ResourceAttributes: map[string]string{AttrProjectID: "proj_123"},
+	}
+	conflicts := codexConflictsInLayer(data, layer, redacted)
+	var keys []string
+	for _, c := range conflicts {
+		keys = append(keys, c.Key)
+		if !c.Advisory || c.Clearable {
+			t.Errorf("profile conflict %+v must be advisory and unclearable", c)
+		}
+	}
+	want := []string{
+		"work.config.toml:otel.log_user_prompt",
+		"work.config.toml:otel.tool_result.max_bytes",
+		"work.config.toml:otel.span_attributes.mirador.project.id",
+		"work.config.toml:analytics.enabled",
+	}
+	if !reflect.DeepEqual(keys, want) {
+		t.Fatalf("conflict keys = %v, want %v", keys, want)
+	}
+
+	// The same layer agrees with a connect that captures everything for that project
+	// and does not export metrics: nothing to report.
+	agreeing := Exporter{
+		Endpoint: miradorEndpoint, Signals: []Signal{SignalTraces, SignalLogs},
+		IncludePrompts: true, IncludeToolContent: true,
+		ResourceAttributes: map[string]string{AttrProjectID: "proj_other"},
+	}
+	if conflicts := codexConflictsInLayer(data, layer, agreeing); len(conflicts) != 0 {
+		t.Fatalf("got %+v, want none when the layer agrees with the connect", conflicts)
 	}
 }
 

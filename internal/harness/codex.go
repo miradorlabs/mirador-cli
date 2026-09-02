@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -86,11 +87,11 @@ const (
 	// layered over config.toml while that profile is selected with --profile.
 	codexProfileSuffix = ".config.toml"
 
-	// The administrator-managed layers, which outrank everything the user writes. The
-	// file is read on macOS and Linux; the managed preference is macOS-only and is what
-	// an MDM profile delivers, as a base64-encoded config.toml. Windows has neither:
-	// Codex 0.152 ignores a managed_config.toml there and says so at startup.
+	// The administrator-managed layers, which outrank everything the user writes: a
+	// managed_config.toml (see codexManagedConflicts for where), and on macOS the
+	// managed preference an MDM profile delivers, a base64-encoded config.toml.
 	codexManagedConfigUnix       = "/etc/codex/managed_config.toml"
+	codexManagedConfigWindows    = "managed_config.toml"
 	codexManagedPreferenceDomain = "com.openai.codex"
 	codexManagedPreferenceKey    = "config_toml_base64"
 )
@@ -388,8 +389,14 @@ func (c Codex) Status() (Status, error) {
 	// this file is internally consistent. Computed before the analytics check below
 	// drops metrics, so that check is what gets reported.
 	status.Conflicts = codexConflicts(f, Exporter{
-		Endpoint: status.Endpoint,
-		Signals:  status.Signals,
+		Endpoint:           status.Endpoint,
+		Signals:            status.Signals,
+		IncludePrompts:     status.IncludePrompts,
+		IncludeToolContent: status.IncludeToolContent,
+		ResourceAttributes: map[string]string{
+			AttrEnduserID: codexSpanAttribute(f.otel, AttrEnduserID),
+			AttrProjectID: status.ProjectID,
+		},
 	})
 	// A metrics exporter with analytics disabled is set and sends nothing. Reporting
 	// metrics as on would send someone hunting in Mirador for data Codex never sent.
@@ -502,24 +509,53 @@ func codexConflicts(f *tomlFile, e Exporter) []Conflict {
 	return out
 }
 
-// codexManagedConflicts reports exporters set by an administrator, in the layers that
-// outrank the user config: /etc/codex/managed_config.toml on macOS and Linux, and on
-// macOS the managed preference an MDM profile delivers. A project's .codex/config.toml
-// is deliberately not scanned: Codex refuses `otel` from project-local config, so a
-// setting there is inert and must not block a connect.
+// codexLayer is one configuration layer above the user file, for reporting.
+type codexLayer struct {
+	// source qualifies each conflict key — a path, a profile file name, or the managed
+	// preference id — so a status report cannot mistake it for the user config.
+	source string
+	scope  string
+	// where opens every reason: what the layer is and when Codex applies it.
+	where string
+	// advisory is set for a layer that applies only when the user selects it.
+	advisory bool
+}
+
+// codexManagedConflicts reports settings an administrator has placed above the user
+// config: managed_config.toml, and on macOS the managed preference an MDM profile
+// delivers. A project's .codex/config.toml is deliberately not scanned: Codex refuses
+// `otel` from project-local config, so a setting there is inert and must not block.
+//
+// On macOS and Linux the file is /etc/codex/managed_config.toml. On Windows it is
+// $CODEX_HOME/managed_config.toml, which Codex 0.150 and later ignore with a startup
+// warning while earlier builds apply above the user config. It is read regardless: a
+// file that is there is either live or a leftover Codex itself complains about, and
+// neither is Mirador's to overlook.
 func codexManagedConflicts(e Exporter) []Conflict {
 	var out []Conflict
-	if runtime.GOOS != "windows" {
-		if data, err := os.ReadFile(codexManagedConfigUnix); err == nil {
-			out = append(out, codexConflictsInLayer(data, codexManagedConfigUnix, ScopeManaged,
-				"set in "+codexManagedConfigUnix+", which Codex applies over your user config", e)...)
+	path := codexManagedConfigUnix
+	if runtime.GOOS == "windows" {
+		home, err := codexHome()
+		if err != nil {
+			return nil
 		}
+		path = filepath.Join(home, codexManagedConfigWindows)
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		out = append(out, codexConflictsInLayer(data, codexLayer{
+			source: path,
+			scope:  ScopeManaged,
+			where:  "set in " + path + ", which Codex applies over your user config",
+		}, e)...)
 	}
 	if runtime.GOOS == "darwin" {
 		if data, ok := codexManagedPreference(); ok {
 			source := codexManagedPreferenceDomain + ":" + codexManagedPreferenceKey
-			out = append(out, codexConflictsInLayer(data, source, ScopeManaged,
-				"set by the managed preference "+source+", which Codex applies over your user config", e)...)
+			out = append(out, codexConflictsInLayer(data, codexLayer{
+				source: source,
+				scope:  ScopeManaged,
+				where:  "set by the managed preference " + source + ", which Codex applies over your user config",
+			}, e)...)
 		}
 	}
 	return out
@@ -541,10 +577,11 @@ func codexManagedPreference() ([]byte, bool) {
 	return decoded, true
 }
 
-// codexProfileConflicts reports exporters set in a profile file — `<name>.config.toml`
-// beside config.toml — which is layered over the user config whenever that profile is
+// codexProfileConflicts reports settings in profile files — `<name>.config.toml` beside
+// config.toml — which Codex layers over the user config only while that profile is
 // selected with --profile. Which profile a session will use is not knowable here, so
-// every profile is scanned; the reason names the one at fault.
+// every profile is scanned and each finding is advisory: named, so the user can decide,
+// but not a reason to refuse the connect that the plain configuration asked for.
 func codexProfileConflicts(e Exporter) []Conflict {
 	home, err := codexHome()
 	if err != nil {
@@ -566,20 +603,27 @@ func codexProfileConflicts(e Exporter) []Conflict {
 		if err != nil {
 			continue
 		}
-		out = append(out, codexConflictsInLayer(data, name, ScopeProfile,
-			"set in "+path+", which Codex applies over your user config whenever that profile is selected with --profile "+profile, e)...)
+		out = append(out, codexConflictsInLayer(data, codexLayer{
+			source:   name,
+			scope:    ScopeProfile,
+			where:    "set in " + path + ", which Codex applies over your user config only while that profile is selected with --profile " + profile,
+			advisory: true,
+		}, e)...)
 	}
 	return out
 }
 
-// codexConflictsInLayer reports any exporter for a selected signal in a higher-
-// precedence layer. Any value counts, including an explicit "none": that layer decides
-// the signal's destination, and the user-level exporter Mirador writes would never be
-// consulted. Keys are qualified by their source, so a status report cannot mistake
-// them for settings in the user config.
-func codexConflictsInLayer(data []byte, source, scope, reason string, e Exporter) []Conflict {
+// codexConflictsInLayer reports every setting in a higher-precedence layer that would
+// change what the export e describes: an exporter for a selected signal (any value,
+// including an explicit "none" — the layer decides the destination, and the user-level
+// exporter is never consulted), the two content switches when they contradict the
+// posture Mirador is writing, an attribution attribute set to something else, and the
+// analytics opt-out that silences metrics. Codex merges layers table by table, so each
+// of these overrides exactly the key it names.
+func codexConflictsInLayer(data []byte, layer codexLayer, e Exporter) []Conflict {
 	var doc struct {
-		Otel map[string]any `toml:"otel"`
+		Otel      map[string]any `toml:"otel"`
+		Analytics map[string]any `toml:"analytics"`
 	}
 	if unmarshalTOMLLenient(data, &doc) != nil {
 		// A file this CLI cannot parse is not this CLI's to complain about; Codex will
@@ -588,6 +632,17 @@ func codexConflictsInLayer(data []byte, source, scope, reason string, e Exporter
 	}
 
 	var out []Conflict
+	report := func(key, value, what string) {
+		out = append(out, Conflict{
+			Key:       layer.source + ":" + key,
+			Value:     value,
+			Reason:    layer.where + ", and " + what,
+			Scope:     layer.scope,
+			Clearable: false,
+			Advisory:  layer.advisory,
+		})
+	}
+
 	for _, sk := range codexSignalKeys {
 		if !e.HasSignal(sk.signal) {
 			continue
@@ -597,19 +652,59 @@ func codexConflictsInLayer(data []byte, source, scope, reason string, e Exporter
 			continue
 		}
 		shape := codexExporterOf(v)
+		if shape.Kind == codexExporterOTLPHTTP && shape.Endpoint == e.SignalEndpoint(sk.signal) {
+			continue // the same destination, whichever layer names it
+		}
 		value := shape.Endpoint
 		if value == "" {
 			value = shape.Kind
 		}
-		out = append(out, Conflict{
-			Key:       source + ":" + otelTable + "." + sk.key,
-			Value:     value,
-			Reason:    reason,
-			Scope:     scope,
-			Clearable: false,
-		})
+		report(otelTable+"."+sk.key, value, "decides where "+string(sk.signal)+" go")
+	}
+
+	if v, ok := doc.Otel[codexLogUserPrompt].(bool); ok && v != e.IncludePrompts {
+		report(otelTable+"."+codexLogUserPrompt, strconv.FormatBool(v), "turns prompt capture "+switchWord(v))
+	}
+	if table, ok := doc.Otel[codexToolResult].(map[string]any); ok {
+		if n, ok := tomlInt(table[codexToolResultMaxBytes]); ok && (n > 0) != e.IncludeToolContent {
+			report(otelTable+"."+codexToolResult+"."+codexToolResultMaxBytes, strconv.FormatInt(n, 10),
+				"turns tool output capture "+switchWord(n > 0))
+		}
+	}
+	if attrs, ok := doc.Otel[codexSpanAttributes].(map[string]any); ok {
+		for _, key := range []string{AttrEnduserID, AttrProjectID} {
+			v, ok := attrs[key].(string)
+			if !ok || v == e.ResourceAttributes[key] {
+				continue
+			}
+			report(otelTable+"."+codexSpanAttributes+"."+key, v, "changes the "+key+" stamped on spans")
+		}
+	}
+	if e.HasSignal(SignalMetrics) {
+		if v, ok := doc.Analytics[codexAnalyticsEnabledKey].(bool); ok && !v {
+			report(codexAnalyticsTable+"."+codexAnalyticsEnabledKey, "false", "disables analytics, which silences metrics")
+		}
 	}
 	return out
+}
+
+func switchWord(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
+}
+
+// tomlInt reads an integer TOML value, tolerating the float a hand edit might produce.
+func tomlInt(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case float64:
+		return int64(n), true
+	default:
+		return 0, false
+	}
 }
 
 // Connect merges Mirador's keys into the otel table, leaving every other key — in the

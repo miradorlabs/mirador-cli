@@ -340,14 +340,23 @@ so you can find and revoke it in the web app.
 Both harnesses layer settings from other places over the user file Mirador writes.
 Claude Code reads project `.claude/settings.json` files and the shell environment; the
 scan covers the directory you run `connect` from, so a session started elsewhere may
-see different project settings. Codex applies an administrator's
-`/etc/codex/managed_config.toml` (macOS and Linux) or, on macOS, the
-`com.openai.codex` managed preference an MDM profile delivers, and a profile file
-(`<name>.config.toml` beside `config.toml`) whenever that profile is selected with
-`--profile`. Codex deliberately ignores `otel` in a project's `.codex/config.toml`, so
-that is neither honoured nor scanned. A telemetry setting found in a layer that outranks
-the user file is reported as a conflict Mirador cannot clear, and connect refuses until
-it is removed.
+see different project settings. Codex applies an administrator's `managed_config.toml`
+(`/etc/codex/managed_config.toml` on macOS and Linux; `~/.codex/managed_config.toml`
+on Windows, which Codex 0.150 and later ignore with a startup warning but earlier builds
+honour) and, on macOS, the `com.openai.codex` managed preference an MDM profile
+delivers. Codex deliberately ignores `otel` in a project's `.codex/config.toml`, so that
+is neither honoured nor scanned. In each layer Mirador checks not just the exporters but
+everything that could overturn the plan it printed: `log_user_prompt`,
+`tool_result.max_bytes`, the `enduser.id` and `mirador.project.id` span attributes, and
+`[analytics] enabled`. A managed setting that contradicts the connect is a conflict
+Mirador cannot clear, and connect refuses until it is removed.
+
+Codex profile files (`<name>.config.toml` beside `config.toml`) are layered over the
+user config only while that profile is selected with `--profile <name>`, and Mirador
+cannot know which profile a session will use. Their overrides are therefore checked the
+same way but reported as advisory — printed before the confirmation with the profile
+named, listed under `warnings` in `status --output json` — without blocking the connect
+or marking the harness overridden.
 
 `disconnect codex` acts only on what its own journal records. No earlier release wrote
 a Codex config, so a `[otel]` table without a journal is somebody else's — a company

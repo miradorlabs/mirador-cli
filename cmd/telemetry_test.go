@@ -308,6 +308,85 @@ func TestTelemetryCodexRefusesMetricsWhenAnalyticsDisabled(t *testing.T) {
 	}
 }
 
+// A dormant profile that overturns the privacy posture — or points a signal elsewhere —
+// is reported before the confirmation, with the profile named, but does not block a
+// connect that the plain configuration asked for; status likewise lists it as a warning
+// rather than calling the harness overridden.
+func TestTelemetryCodexProfileOverridesAreReportedNotBlocking(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	t.Setenv("MIRADOR_CONFIG_DIR", t.TempDir())
+	profile := "[analytics]\nenabled = false\n\n[otel]\nexporter = \"none\"\nlog_user_prompt = true\ntool_result = { max_bytes = 2048 }\n"
+	if err := os.WriteFile(filepath.Join(dir, "work.config.toml"), []byte(profile), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var out bytes.Buffer
+	root := NewRootCommand()
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{
+		"telemetry", "connect", "codex",
+		"--api-key", "mir_srv_profiles",
+		"--project", "770e8400-e29b-41d4-a716-446655440000",
+		"--exclude-prompts", "--exclude-tool-content",
+		"--yes",
+	})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("a dormant profile blocked the connect: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "reported, not blocking") {
+		t.Errorf("the plan did not introduce the profile overrides as advisory:\n%s", got)
+	}
+	for _, key := range []string{
+		"work.config.toml:otel.exporter=none",
+		"work.config.toml:otel.log_user_prompt=true",
+		"work.config.toml:otel.tool_result.max_bytes=2048",
+		"work.config.toml:analytics.enabled=false",
+	} {
+		if !strings.Contains(got, key) {
+			t.Errorf("the plan did not name %s:\n%s", key, got)
+		}
+	}
+	if !strings.Contains(got, "--profile work") {
+		t.Errorf("the plan did not say which profile selects the overrides:\n%s", got)
+	}
+
+	out.Reset()
+	root = NewRootCommand()
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"telemetry", "status", "codex", "-o", "json"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(out.String(), `"state": "connected"`) || strings.Contains(out.String(), "overridden") {
+		t.Errorf("status treated a dormant profile as an override:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), `"warnings"`) || !strings.Contains(out.String(), "work.config.toml:otel.log_user_prompt") {
+		t.Errorf("status did not list the profile overrides as warnings:\n%s", out.String())
+	}
+}
+
+// A conflict key can carry a file name, and a file name can carry anything. What
+// reaches the terminal must be stripped of control characters, key included.
+func TestPrintConflictsSanitizesEveryField(t *testing.T) {
+	var out bytes.Buffer
+	printConflicts(&out, []harness.Conflict{{
+		Key:    "evil\x1b[31m.config.toml:otel.exporter",
+		Value:  "https://x\x1b[0m",
+		Reason: "because\x07",
+		Scope:  harness.ScopeProfile + "\x1b[2J",
+	}}, false)
+	if strings.ContainsAny(out.String(), "\x1b\x07") {
+		t.Fatalf("control characters reached the output:\n%q", out.String())
+	}
+	if !strings.Contains(out.String(), "evil[31m.config.toml:otel.exporter") {
+		t.Errorf("the key was not printed with only its control characters removed:\n%q", out.String())
+	}
+}
+
 // --inline-key is Claude's opt-out of the helper; for Codex inline is the only mode,
 // and the flag must be accepted rather than rejected as inapplicable.
 func TestTelemetryCodexInlineKeyFlagIsAccepted(t *testing.T) {

@@ -183,6 +183,12 @@ type Conflict struct {
 	// clearable is fatal even under --force: pretending to fix it would write the
 	// credential and leave the override in force.
 	Clearable bool
+
+	// Advisory marks a setting that only takes effect in a mode the user has to select
+	// explicitly — a Codex profile — so whether it applies to the next session cannot be
+	// known here. It is reported so the user can decide, but it neither blocks a connect
+	// nor needs --force, and status does not call the harness overridden for it.
+	Advisory bool
 }
 
 // Conflict scopes.
