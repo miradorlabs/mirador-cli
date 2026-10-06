@@ -47,8 +47,18 @@ jobs:
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
 
-          # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr:*)'
+          # Every PR review starts with a rating out of 10; under 8 is flagged as not acceptable.
+          claude_args: >-
+            --append-system-prompt "When the task is to review a pull request, start the review body with a
+            heading of the form ## Rating: X/10, rating the whole PR at its current head. Score it out of 10 on
+            three dimensions and list each score under the heading. Architecture: is the change in the right
+            place, with the right boundaries and data flow? Does it fit the system's existing design, or work
+            around it? Maintainability: can the next engineer read, change and test it? Is it simple and minimal,
+            matching the codebase's idioms, with tests that pin the behaviour? Scalability: does it hold up under
+            real load and growth (more data, users, sessions, concurrency), with no hidden O(n²), unbounded growth
+            or contention? The overall score combines the three. Correctness is a precondition, not a dimension:
+            a known bug fails the rating outright. If the overall or any dimension is below 8, put this line
+            directly under the heading: ❌ **NOT ACCEPTABLE: below the 8/10 bar. Do not merge until it is fixed
+            and re-reviewed.** Otherwise put: ✅ **Meets the 8/10 bar.** Do not rate anything that is not a pull
+            request review."
 
