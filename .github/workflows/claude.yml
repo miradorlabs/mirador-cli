@@ -28,10 +28,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # issue_comment payloads are issue-shaped, so without an explicit ref the
-          # checkout lands on the default branch and files added/renamed by the PR are
-          # missing — fetchGitHubData then aborts on them. Check out the PR head instead.
-          ref: ${{ github.event.pull_request.head.sha || (github.event.issue.pull_request && format('refs/pull/{0}/head', github.event.issue.number)) || '' }}
+          # Check out the trusted default branch only. This job holds secrets and an
+          # OIDC token, so it must not check out PR code itself. claude-code-action
+          # checks out the PR branch on its own and restores .claude/ and .mcp.json
+          # from the base branch before running the CLI.
           fetch-depth: 1
 
       - name: Run Claude Code
