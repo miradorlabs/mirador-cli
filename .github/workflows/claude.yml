@@ -28,10 +28,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Check out the trusted default branch only. This job holds secrets and an
-          # OIDC token, so it must not check out PR code itself. claude-code-action
-          # checks out the PR branch on its own and restores .claude/ and .mcp.json
-          # from the base branch before running the CLI.
+          # This job holds secrets and an OIDC token, so check out only a trusted
+          # commit, never the PR head or merge ref: the PR's base commit, or the
+          # default-branch head for issue events. claude-code-action checks out the
+          # PR branch itself and restores .claude/ and .mcp.json from the base branch
+          # before running the CLI. Checking out a SHA leaves HEAD detached, so the
+          # action can fetch a fork PR whose branch is also named main.
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 1
 
       - name: Run Claude Code
